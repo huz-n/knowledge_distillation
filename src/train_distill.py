@@ -160,15 +160,18 @@ def run_epoch(
 
         with torch.autocast(device_type=device.type, enabled=autocast_enabled):
             student_logits, student_emb = student(x, return_embedding=True)
-            proj_emb = projector(student_emb)
+            proj_emb = F.normalize(projector(student_emb), dim=1)
+            teacher_emb = F.normalize(teacher_emb, dim=1)
+            
 
             cls_loss = cls_criterion(student_logits, y)
-            embed_loss = embed_loss_value(
-                loss_fn=embed_criterion,
-                student_emb=proj_emb,
-                teacher_emb=teacher_emb,
-                loss_name=embed_loss_name,
-            )
+            # embed_loss = embed_loss_value(
+            #     loss_fn=embed_criterion,
+            #     student_emb=proj_emb,
+            #     teacher_emb=teacher_emb,
+            #     loss_name=embed_loss_name,
+            # )
+            embed_loss = F.mse_loss(proj_emb, teacher_emb)
             kd_loss = logit_kd_loss(student_logits, teacher_logits, temperature=temperature)
             total = cls_weight * cls_loss + embed_weight * embed_loss + logit_weight * kd_loss
 
@@ -326,7 +329,11 @@ def main() -> None:
     if student.embedding_dim == teacher.embedding_dim:
         projector: nn.Module = nn.Identity()
     else:
-        projector = nn.Linear(student.embedding_dim, teacher.embedding_dim)
+        projector = nn.Sequential(
+            nn.Linear(512, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 2048)
+        )
     projector = projector.to(device)
     projector_total_params = sum(p.numel() for p in projector.parameters())
 
