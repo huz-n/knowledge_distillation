@@ -15,6 +15,11 @@ Current scope:
 
 1. Open `notebooks/colab_baseline_runner.ipynb` in Colab for a smoke test.
 2. Open `notebooks/colab_distill_runner.ipynb` for full core runs (teacher + 2 students + plots).
+3. Both notebooks mount Google Drive and cache everything under:
+   - `/content/drive/MyDrive/PSI_main/knowledge_distillation` (repo)
+   - `/content/drive/MyDrive/PSI_main/data` (dataset)
+   - `/content/drive/MyDrive/PSI_main/cache` (torch/pip/hf caches)
+   - `/content/drive/MyDrive/PSI_main/outputs` (all run artifacts)
 2. Run all cells in order.
 3. First run a short sanity pass (`--max-train-batches` / `--max-val-batches`), then scale epochs/batch size.
 
