@@ -34,6 +34,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-size", type=int, default=5000)
     parser.add_argument("--max-items", type=int, default=2000)
     parser.add_argument("--tsne-perplexity", type=float, default=30.0)
+    parser.add_argument(
+        "--align-mode",
+        type=str,
+        default="lstsq_procrustes",
+        choices=["none", "lstsq", "lstsq_procrustes"],
+        help="How to align student embeddings to teacher space for joint visualization.",
+    )
+    parser.add_argument(
+        "--normalize-mode",
+        type=str,
+        default="l2_zscore",
+        choices=["none", "l2", "zscore", "l2_zscore"],
+        help="Per-model normalization before PCA/t-SNE.",
+    )
     return parser.parse_args()
 
 
@@ -83,6 +97,60 @@ def load_distill_student(
     return model, projector
 
 
+def _l2_normalize_rows(x: np.ndarray) -> np.ndarray:
+    denom = np.linalg.norm(x, axis=1, keepdims=True)
+    denom = np.maximum(denom, 1e-12)
+    return x / denom
+
+
+def _zscore_features(x: np.ndarray) -> np.ndarray:
+    mu = x.mean(axis=0, keepdims=True)
+    sigma = x.std(axis=0, keepdims=True)
+    sigma = np.maximum(sigma, 1e-6)
+    return (x - mu) / sigma
+
+
+def normalize_embeddings(x: np.ndarray, mode: str) -> np.ndarray:
+    out = x.astype(np.float64, copy=True)
+    if mode in {"l2", "l2_zscore"}:
+        out = _l2_normalize_rows(out)
+    if mode in {"zscore", "l2_zscore"}:
+        out = _zscore_features(out)
+    return out.astype(np.float32)
+
+
+def _orthogonal_procrustes_map(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    # Solves min ||A R - B||_F with R^T R = I
+    m = a.T @ b
+    u, _, vt = np.linalg.svd(m, full_matrices=False)
+    r = u @ vt
+    return r
+
+
+def align_to_teacher_space(teacher: np.ndarray, student: np.ndarray, mode: str) -> np.ndarray:
+    if mode == "none":
+        if student.shape[1] != teacher.shape[1]:
+            # Minimum fallback to make dimensions compatible in joint plots.
+            w = np.linalg.lstsq(student, teacher, rcond=None)[0]
+            return student @ w
+        return student
+
+    mapped = student
+    if mapped.shape[1] != teacher.shape[1]:
+        w = np.linalg.lstsq(mapped, teacher, rcond=None)[0]
+        mapped = mapped @ w
+    elif mode == "lstsq":
+        w = np.linalg.lstsq(mapped, teacher, rcond=None)[0]
+        mapped = mapped @ w
+
+    if mode == "lstsq_procrustes":
+        a = mapped - mapped.mean(axis=0, keepdims=True)
+        b = teacher - teacher.mean(axis=0, keepdims=True)
+        r = _orthogonal_procrustes_map(a, b)
+        mapped = a @ r
+    return mapped
+
+
 @torch.no_grad()
 def collect_embeddings(
     teacher: torch.nn.Module,
@@ -121,13 +189,6 @@ def collect_embeddings(
     distill_arr = torch.cat(distill_embs, dim=0)[:max_items].numpy()
     label_arr = torch.cat(labels, dim=0)[:max_items].numpy()
 
-    # Align baseline to teacher space so combined plots are directly comparable.
-    if baseline_arr.shape[1] != teacher_arr.shape[1]:
-        x = torch.from_numpy(baseline_arr).float()
-        y = torch.from_numpy(teacher_arr).float()
-        solution = torch.linalg.lstsq(x, y).solution
-        baseline_arr = (x @ solution).numpy()
-
     return {
         "teacher": teacher_arr,
         "baseline": baseline_arr,
@@ -150,6 +211,20 @@ def _scatter_classes(ax: plt.Axes, coords: np.ndarray, labels: np.ndarray, title
     plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
 
 
+def _two_dim_projection(x: np.ndarray, seed: int, perplexity: float) -> Tuple[np.ndarray, np.ndarray]:
+    pca = PCA(n_components=2, random_state=seed)
+    coords_pca = pca.fit_transform(x)
+    tsne = TSNE(
+        n_components=2,
+        perplexity=perplexity,
+        random_state=seed,
+        init="pca",
+        learning_rate="auto",
+    )
+    coords_tsne = tsne.fit_transform(x)
+    return coords_pca, coords_tsne
+
+
 def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
@@ -168,6 +243,7 @@ def main() -> None:
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         image_size=args.image_size,
+        augment="none",
         val_size=args.val_size,
         seed=args.seed,
         max_test_items=args.max_items,
@@ -182,36 +258,43 @@ def main() -> None:
         max_items=args.max_items,
     )
 
-    teacher_arr = bundle["teacher"]
-    baseline_arr = bundle["baseline"]
-    distill_arr = bundle["distill"]
+    teacher_raw = bundle["teacher"]
+    baseline_raw = bundle["baseline"]
+    distill_raw = bundle["distill"]
     labels = bundle["labels"]
 
+    # Fair alignment: both baseline and distilled embeddings are transformed with the same policy.
+    baseline_aligned = align_to_teacher_space(
+        teacher=teacher_raw, student=baseline_raw, mode=args.align_mode
+    )
+    distill_aligned = align_to_teacher_space(
+        teacher=teacher_raw, student=distill_raw, mode=args.align_mode
+    )
+    teacher_aligned = teacher_raw
+    if args.align_mode == "lstsq_procrustes":
+        teacher_aligned = teacher_raw - teacher_raw.mean(axis=0, keepdims=True)
+
+    teacher_arr = normalize_embeddings(teacher_aligned, mode=args.normalize_mode)
+    baseline_arr = normalize_embeddings(baseline_aligned, mode=args.normalize_mode)
+    distill_arr = normalize_embeddings(distill_aligned, mode=args.normalize_mode)
+
+    # Joint space plots (all models together).
     stacked = np.concatenate([teacher_arr, baseline_arr, distill_arr], axis=0)
     model_names = np.array(
         ["teacher"] * len(teacher_arr) + ["baseline"] * len(baseline_arr) + ["distill"] * len(distill_arr)
     )
-
-    pca = PCA(n_components=2, random_state=args.seed)
-    coords_pca = pca.fit_transform(stacked)
-
-    tsne = TSNE(
-        n_components=2,
-        perplexity=args.tsne_perplexity,
-        random_state=args.seed,
-        init="pca",
-        learning_rate="auto",
+    coords_pca, coords_tsne = _two_dim_projection(
+        x=stacked, seed=args.seed, perplexity=args.tsne_perplexity
     )
-    coords_tsne = tsne.fit_transform(stacked)
 
     fig, ax = plt.subplots(figsize=(7, 5))
-    _scatter_models(ax, coords_pca, model_names, "PCA: Teacher vs Baseline vs Distill")
+    _scatter_models(ax, coords_pca, model_names, "PCA (joint): Teacher vs Baseline vs Distill")
     fig.tight_layout()
     fig.savefig(output_dir / "pca_models.png", dpi=140)
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(7, 5))
-    _scatter_models(ax, coords_tsne, model_names, "t-SNE: Teacher vs Baseline vs Distill")
+    _scatter_models(ax, coords_tsne, model_names, "t-SNE (joint): Teacher vs Baseline vs Distill")
     fig.tight_layout()
     fig.savefig(output_dir / "tsne_models.png", dpi=140)
     plt.close(fig)
@@ -225,31 +308,56 @@ def main() -> None:
     )
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    _scatter_classes(axes[0], teacher_pca, labels, "Teacher (PCA, by class)")
-    _scatter_classes(axes[1], baseline_pca, labels, "Baseline Student (PCA, by class)")
-    _scatter_classes(axes[2], distill_pca, labels, "Distill Student (PCA, by class)")
+    _scatter_classes(axes[0], teacher_pca, labels, "Teacher (PCA, joint space)")
+    _scatter_classes(axes[1], baseline_pca, labels, "Baseline (PCA, joint space)")
+    _scatter_classes(axes[2], distill_pca, labels, "Distill (PCA, joint space)")
     fig.tight_layout()
     fig.savefig(output_dir / "pca_by_class.png", dpi=140)
     plt.close(fig)
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    _scatter_classes(axes[0], teacher_tsne, labels, "Teacher (t-SNE, by class)")
-    _scatter_classes(axes[1], baseline_tsne, labels, "Baseline Student (t-SNE, by class)")
-    _scatter_classes(axes[2], distill_tsne, labels, "Distill Student (t-SNE, by class)")
+    _scatter_classes(axes[0], teacher_tsne, labels, "Teacher (t-SNE, joint space)")
+    _scatter_classes(axes[1], baseline_tsne, labels, "Baseline (t-SNE, joint space)")
+    _scatter_classes(axes[2], distill_tsne, labels, "Distill (t-SNE, joint space)")
     fig.tight_layout()
     fig.savefig(output_dir / "tsne_by_class.png", dpi=140)
     plt.close(fig)
 
+    # Per-model standalone plots (not forced into one shared space).
+    teacher_pca_s, teacher_tsne_s = _two_dim_projection(teacher_arr, args.seed, args.tsne_perplexity)
+    baseline_pca_s, baseline_tsne_s = _two_dim_projection(baseline_arr, args.seed, args.tsne_perplexity)
+    distill_pca_s, distill_tsne_s = _two_dim_projection(distill_arr, args.seed, args.tsne_perplexity)
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    _scatter_classes(axes[0], teacher_pca_s, labels, "Teacher (PCA, standalone)")
+    _scatter_classes(axes[1], baseline_pca_s, labels, "Baseline (PCA, standalone)")
+    _scatter_classes(axes[2], distill_pca_s, labels, "Distill (PCA, standalone)")
+    fig.tight_layout()
+    fig.savefig(output_dir / "pca_by_class_standalone.png", dpi=140)
+    plt.close(fig)
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    _scatter_classes(axes[0], teacher_tsne_s, labels, "Teacher (t-SNE, standalone)")
+    _scatter_classes(axes[1], baseline_tsne_s, labels, "Baseline (t-SNE, standalone)")
+    _scatter_classes(axes[2], distill_tsne_s, labels, "Distill (t-SNE, standalone)")
+    fig.tight_layout()
+    fig.savefig(output_dir / "tsne_by_class_standalone.png", dpi=140)
+    plt.close(fig)
+
     meta = {
         "num_points": int(n),
-        "teacher_dim": int(teacher_arr.shape[1]),
-        "baseline_dim_after_alignment": int(baseline_arr.shape[1]),
-        "distill_dim": int(distill_arr.shape[1]),
+        "teacher_raw_dim": int(teacher_raw.shape[1]),
+        "baseline_raw_dim": int(baseline_raw.shape[1]),
+        "distill_raw_dim": int(distill_raw.shape[1]),
+        "align_mode": args.align_mode,
+        "normalize_mode": args.normalize_mode,
         "artifacts": [
             "pca_models.png",
             "tsne_models.png",
             "pca_by_class.png",
             "tsne_by_class.png",
+            "pca_by_class_standalone.png",
+            "tsne_by_class_standalone.png",
         ],
     }
     with (output_dir / "metadata.json").open("w", encoding="utf-8") as f:
