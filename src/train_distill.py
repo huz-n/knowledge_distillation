@@ -10,11 +10,13 @@ from typing import Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm.auto import tqdm
 
 from src.data import build_cifar10_loaders
+from src.metrics import RunningClassificationMetrics
 from src.models import build_model_with_embedding
 
 
@@ -23,19 +25,23 @@ class EpochMetrics:
     epoch: int
     train_total_loss: float
     train_cls_loss: float
-    train_distill_loss: float
+    train_embed_loss: float
+    train_logit_loss: float
     train_acc: float
+    train_f1: float
     val_total_loss: float
     val_cls_loss: float
-    val_distill_loss: float
+    val_embed_loss: float
+    val_logit_loss: float
     val_acc: float
+    val_f1: float
     lr: float
     seconds: float
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="CIFAR-10 student training with embedding distillation."
+        description="CIFAR-10 student training with embedding/logit distillation."
     )
     parser.add_argument("--data-dir", type=str, default="./data")
     parser.add_argument("--output-dir", type=str, default="./outputs/distill")
@@ -44,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-checkpoint", type=str, default="")
     parser.add_argument("--teacher-pretrained", action="store_true")
     parser.add_argument("--image-size", type=int, default=160)
+    parser.add_argument("--augment", type=str, default="basic", choices=["none", "basic", "strong"])
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -56,10 +63,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-test-items", type=int, default=0)
     parser.add_argument("--max-train-batches", type=int, default=0)
     parser.add_argument("--max-val-batches", type=int, default=0)
-    parser.add_argument("--distill-loss", type=str, default="mse", choices=["mse", "cosine"])
-    parser.add_argument("--alpha", type=float, default=1.0)
-    parser.add_argument("--beta", type=float, default=1.0)
-    parser.add_argument("--distill-only", action="store_true")
+    parser.add_argument("--embed-loss", type=str, default="mse", choices=["mse", "cosine"])
+    parser.add_argument("--cls-weight", type=float, default=1.0)
+    parser.add_argument("--embed-weight", type=float, default=1.0)
+    parser.add_argument("--logit-weight", type=float, default=0.0)
+    parser.add_argument("--temperature", type=float, default=2.0)
     return parser.parse_args()
 
 
@@ -69,15 +77,15 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def build_distill_loss(name: str) -> nn.Module:
+def build_embed_loss(name: str) -> nn.Module:
     if name == "mse":
         return nn.MSELoss()
     if name == "cosine":
         return nn.CosineEmbeddingLoss()
-    raise ValueError(f"Unsupported distill loss: {name}")
+    raise ValueError(f"Unsupported embed loss: {name}")
 
 
-def distill_loss_value(
+def embed_loss_value(
     loss_fn: nn.Module,
     student_emb: torch.Tensor,
     teacher_emb: torch.Tensor,
@@ -89,6 +97,12 @@ def distill_loss_value(
     return loss_fn(student_emb, teacher_emb, target)
 
 
+def logit_kd_loss(student_logits: torch.Tensor, teacher_logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    s = F.log_softmax(student_logits / temperature, dim=1)
+    t = F.softmax(teacher_logits / temperature, dim=1)
+    return F.kl_div(s, t, reduction="batchmean") * (temperature * temperature)
+
+
 def run_epoch(
     student: nn.Module,
     teacher: nn.Module,
@@ -96,15 +110,16 @@ def run_epoch(
     loader: torch.utils.data.DataLoader,
     device: torch.device,
     cls_criterion: nn.Module,
-    distill_criterion: nn.Module,
-    distill_loss_name: str,
-    alpha: float,
-    beta: float,
-    distill_only: bool,
+    embed_criterion: nn.Module,
+    embed_loss_name: str,
+    cls_weight: float,
+    embed_weight: float,
+    logit_weight: float,
+    temperature: float,
     optimizer: Optional[torch.optim.Optimizer] = None,
     scaler: Optional[torch.amp.GradScaler] = None,
     max_batches: int = 0,
-) -> Tuple[float, float, float, float]:
+) -> Tuple[float, float, float, float, float, float]:
     training = optimizer is not None
     student.train(training)
     projector.train(training)
@@ -113,8 +128,9 @@ def run_epoch(
     total_items = 0
     total_loss = 0.0
     total_cls_loss = 0.0
-    total_distill_loss = 0.0
-    total_correct = 0
+    total_embed_loss = 0.0
+    total_logit_loss = 0.0
+    metrics = RunningClassificationMetrics(num_classes=10)
 
     autocast_enabled = device.type == "cuda"
     iterator = tqdm(loader, leave=False, desc="train" if training else "eval")
@@ -131,21 +147,21 @@ def run_epoch(
 
         with torch.no_grad():
             with torch.autocast(device_type=device.type, enabled=autocast_enabled):
-                _, teacher_emb = teacher(x, return_embedding=True)
+                teacher_logits, teacher_emb = teacher(x, return_embedding=True)
 
         with torch.autocast(device_type=device.type, enabled=autocast_enabled):
             student_logits, student_emb = student(x, return_embedding=True)
             proj_emb = projector(student_emb)
+
             cls_loss = cls_criterion(student_logits, y)
-            distill_loss = distill_loss_value(
-                loss_fn=distill_criterion,
+            embed_loss = embed_loss_value(
+                loss_fn=embed_criterion,
                 student_emb=proj_emb,
                 teacher_emb=teacher_emb,
-                loss_name=distill_loss_name,
+                loss_name=embed_loss_name,
             )
-            total = beta * distill_loss
-            if not distill_only:
-                total = total + alpha * cls_loss
+            kd_loss = logit_kd_loss(student_logits, teacher_logits, temperature=temperature)
+            total = cls_weight * cls_loss + embed_weight * embed_loss + logit_weight * kd_loss
 
         if training and optimizer is not None:
             if scaler is not None and autocast_enabled:
@@ -159,17 +175,20 @@ def run_epoch(
         total_items += batch_size
         total_loss += total.item() * batch_size
         total_cls_loss += cls_loss.item() * batch_size
-        total_distill_loss += distill_loss.item() * batch_size
-        total_correct += int((student_logits.argmax(dim=1) == y).sum().item())
+        total_embed_loss += embed_loss.item() * batch_size
+        total_logit_loss += kd_loss.item() * batch_size
+        metrics.update(logits=student_logits, targets=y)
         iterator.set_postfix(total=f"{total.item():.4f}")
 
     if total_items == 0:
-        return 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     return (
         total_loss / total_items,
         total_cls_loss / total_items,
-        total_distill_loss / total_items,
-        total_correct / total_items,
+        total_embed_loss / total_items,
+        total_logit_loss / total_items,
+        metrics.accuracy(),
+        metrics.macro_f1(),
     )
 
 
@@ -180,25 +199,27 @@ def evaluate_test(
     loader: torch.utils.data.DataLoader,
     device: torch.device,
     cls_criterion: nn.Module,
-    distill_criterion: nn.Module,
-    distill_loss_name: str,
-    alpha: float,
-    beta: float,
-    distill_only: bool,
+    embed_criterion: nn.Module,
+    embed_loss_name: str,
+    cls_weight: float,
+    embed_weight: float,
+    logit_weight: float,
+    temperature: float,
     max_batches: int = 0,
 ) -> Dict[str, float]:
-    test_total, test_cls, test_distill, test_acc = run_epoch(
+    test_total, test_cls, test_embed, test_logit, test_acc, test_f1 = run_epoch(
         student=student,
         teacher=teacher,
         projector=projector,
         loader=loader,
         device=device,
         cls_criterion=cls_criterion,
-        distill_criterion=distill_criterion,
-        distill_loss_name=distill_loss_name,
-        alpha=alpha,
-        beta=beta,
-        distill_only=distill_only,
+        embed_criterion=embed_criterion,
+        embed_loss_name=embed_loss_name,
+        cls_weight=cls_weight,
+        embed_weight=embed_weight,
+        logit_weight=logit_weight,
+        temperature=temperature,
         optimizer=None,
         scaler=None,
         max_batches=max_batches,
@@ -206,8 +227,10 @@ def evaluate_test(
     return {
         "test_total_loss": test_total,
         "test_cls_loss": test_cls,
-        "test_distill_loss": test_distill,
+        "test_embed_loss": test_embed,
+        "test_logit_loss": test_logit,
         "test_acc": test_acc,
+        "test_f1": test_f1,
     }
 
 
@@ -215,30 +238,41 @@ def plot_curves(history: List[EpochMetrics], output_path: Path) -> None:
     epochs = [h.epoch for h in history]
     train_total = [h.train_total_loss for h in history]
     val_total = [h.val_total_loss for h in history]
-    train_distill = [h.train_distill_loss for h in history]
-    val_distill = [h.val_distill_loss for h in history]
+    train_embed = [h.train_embed_loss for h in history]
+    val_embed = [h.val_embed_loss for h in history]
+    train_logit = [h.train_logit_loss for h in history]
+    val_logit = [h.val_logit_loss for h in history]
     val_acc = [h.val_acc for h in history]
+    val_f1 = [h.val_f1 for h in history]
 
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4))
-    axes[0].plot(epochs, train_total, label="train_total")
-    axes[0].plot(epochs, val_total, label="val_total")
-    axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("Loss")
-    axes[0].set_title("Total Loss")
-    axes[0].legend()
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+    axes[0, 0].plot(epochs, train_total, label="train_total")
+    axes[0, 0].plot(epochs, val_total, label="val_total")
+    axes[0, 0].set_xlabel("Epoch")
+    axes[0, 0].set_ylabel("Loss")
+    axes[0, 0].set_title("Total Loss")
+    axes[0, 0].legend()
 
-    axes[1].plot(epochs, train_distill, label="train_distill")
-    axes[1].plot(epochs, val_distill, label="val_distill")
-    axes[1].set_xlabel("Epoch")
-    axes[1].set_ylabel("Loss")
-    axes[1].set_title("Distillation Loss")
-    axes[1].legend()
+    axes[0, 1].plot(epochs, train_embed, label="train_embed")
+    axes[0, 1].plot(epochs, val_embed, label="val_embed")
+    axes[0, 1].plot(epochs, train_logit, label="train_logit")
+    axes[0, 1].plot(epochs, val_logit, label="val_logit")
+    axes[0, 1].set_xlabel("Epoch")
+    axes[0, 1].set_ylabel("Loss")
+    axes[0, 1].set_title("Distillation Components")
+    axes[0, 1].legend()
 
-    axes[2].plot(epochs, val_acc, label="val_acc")
-    axes[2].set_xlabel("Epoch")
-    axes[2].set_ylabel("Accuracy")
-    axes[2].set_title("Validation Accuracy")
-    axes[2].legend()
+    axes[1, 0].plot(epochs, val_acc, label="val_acc")
+    axes[1, 0].set_xlabel("Epoch")
+    axes[1, 0].set_ylabel("Accuracy")
+    axes[1, 0].set_title("Validation Accuracy")
+    axes[1, 0].legend()
+
+    axes[1, 1].plot(epochs, val_f1, label="val_macro_f1")
+    axes[1, 1].set_xlabel("Epoch")
+    axes[1, 1].set_ylabel("F1")
+    axes[1, 1].set_title("Validation Macro-F1")
+    axes[1, 1].legend()
 
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -251,6 +285,9 @@ def main() -> None:
     seed_everything(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.cls_weight == 0 and args.embed_weight == 0 and args.logit_weight == 0:
+        raise ValueError("At least one of --cls-weight / --embed-weight / --logit-weight must be > 0.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     teacher_pretrained = args.teacher_pretrained or not bool(args.teacher_checkpoint)
@@ -271,9 +308,8 @@ def main() -> None:
     student_total_params = sum(p.numel() for p in student.parameters())
     student_trainable_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
 
-    projector: nn.Module
     if student.embedding_dim == teacher.embedding_dim:
-        projector = nn.Identity()
+        projector: nn.Module = nn.Identity()
     else:
         projector = nn.Linear(student.embedding_dim, teacher.embedding_dim)
     projector = projector.to(device)
@@ -284,6 +320,7 @@ def main() -> None:
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         image_size=args.image_size,
+        augment=args.augment,
         val_size=args.val_size,
         seed=args.seed,
         max_train_items=args.max_train_items if args.max_train_items > 0 else None,
@@ -292,7 +329,7 @@ def main() -> None:
     )
 
     cls_criterion = nn.CrossEntropyLoss()
-    distill_criterion = build_distill_loss(args.distill_loss)
+    embed_criterion = build_embed_loss(args.embed_loss)
     optimizer = AdamW(
         list(student.parameters()) + list(projector.parameters()),
         lr=args.lr,
@@ -307,34 +344,36 @@ def main() -> None:
 
     for epoch in range(1, args.epochs + 1):
         start = time.time()
-        train_total, train_cls, train_distill, train_acc = run_epoch(
+        train_total, train_cls, train_embed, train_logit, train_acc, train_f1 = run_epoch(
             student=student,
             teacher=teacher,
             projector=projector,
             loader=loaders.train,
             device=device,
             cls_criterion=cls_criterion,
-            distill_criterion=distill_criterion,
-            distill_loss_name=args.distill_loss,
-            alpha=args.alpha,
-            beta=args.beta,
-            distill_only=args.distill_only,
+            embed_criterion=embed_criterion,
+            embed_loss_name=args.embed_loss,
+            cls_weight=args.cls_weight,
+            embed_weight=args.embed_weight,
+            logit_weight=args.logit_weight,
+            temperature=args.temperature,
             optimizer=optimizer,
             scaler=scaler,
             max_batches=args.max_train_batches,
         )
-        val_total, val_cls, val_distill, val_acc = run_epoch(
+        val_total, val_cls, val_embed, val_logit, val_acc, val_f1 = run_epoch(
             student=student,
             teacher=teacher,
             projector=projector,
             loader=loaders.val,
             device=device,
             cls_criterion=cls_criterion,
-            distill_criterion=distill_criterion,
-            distill_loss_name=args.distill_loss,
-            alpha=args.alpha,
-            beta=args.beta,
-            distill_only=args.distill_only,
+            embed_criterion=embed_criterion,
+            embed_loss_name=args.embed_loss,
+            cls_weight=args.cls_weight,
+            embed_weight=args.embed_weight,
+            logit_weight=args.logit_weight,
+            temperature=args.temperature,
             optimizer=None,
             scaler=None,
             max_batches=args.max_val_batches,
@@ -346,20 +385,26 @@ def main() -> None:
             epoch=epoch,
             train_total_loss=train_total,
             train_cls_loss=train_cls,
-            train_distill_loss=train_distill,
+            train_embed_loss=train_embed,
+            train_logit_loss=train_logit,
             train_acc=train_acc,
+            train_f1=train_f1,
             val_total_loss=val_total,
             val_cls_loss=val_cls,
-            val_distill_loss=val_distill,
+            val_embed_loss=val_embed,
+            val_logit_loss=val_logit,
             val_acc=val_acc,
+            val_f1=val_f1,
             lr=float(optimizer.param_groups[0]["lr"]),
             seconds=seconds,
         )
         history.append(metrics)
         print(
             f"[Epoch {epoch}] train_total={train_total:.4f} train_cls={train_cls:.4f} "
-            f"train_distill={train_distill:.4f} train_acc={train_acc:.4f} "
-            f"val_total={val_total:.4f} val_acc={val_acc:.4f} time={seconds:.1f}s"
+            f"train_embed={train_embed:.4f} train_logit={train_logit:.4f} "
+            f"train_acc={train_acc:.4f} train_f1={train_f1:.4f} "
+            f"val_total={val_total:.4f} val_acc={val_acc:.4f} val_f1={val_f1:.4f} "
+            f"time={seconds:.1f}s"
         )
 
         if val_acc > best_val_acc:
@@ -383,11 +428,12 @@ def main() -> None:
         loader=loaders.test,
         device=device,
         cls_criterion=cls_criterion,
-        distill_criterion=distill_criterion,
-        distill_loss_name=args.distill_loss,
-        alpha=args.alpha,
-        beta=args.beta,
-        distill_only=args.distill_only,
+        embed_criterion=embed_criterion,
+        embed_loss_name=args.embed_loss,
+        cls_weight=args.cls_weight,
+        embed_weight=args.embed_weight,
+        logit_weight=args.logit_weight,
+        temperature=args.temperature,
         max_batches=args.max_val_batches,
     )
 
@@ -397,6 +443,7 @@ def main() -> None:
         "device": str(device),
         "teacher_model": args.teacher,
         "teacher_checkpoint_used": bool(args.teacher_checkpoint),
+        "augment": args.augment,
         "student_embedding_dim": student.embedding_dim,
         "teacher_embedding_dim": teacher.embedding_dim,
         "student_total_params": student_total_params,

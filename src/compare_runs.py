@@ -40,6 +40,8 @@ def main() -> None:
         "distill_best_val_acc": float(distill.get("best_val_acc", 0.0)),
         "baseline_test_acc": float(baseline.get("test_acc", 0.0)),
         "distill_test_acc": float(distill.get("test_acc", 0.0)),
+        "baseline_test_f1": float(baseline.get("test_f1", 0.0)),
+        "distill_test_f1": float(distill.get("test_f1", 0.0)),
         "baseline_last_val_loss": extract_last(baseline.get("history", []), "val_loss"),
         "distill_last_val_total_loss": extract_last(distill.get("history", []), "val_total_loss"),
     }
@@ -47,13 +49,21 @@ def main() -> None:
     with (output_dir / "summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    fig, ax = plt.subplots(figsize=(6, 4))
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
     labels = ["baseline", "distill"]
-    values = [summary["baseline_test_acc"], summary["distill_test_acc"]]
-    ax.bar(labels, values)
-    ax.set_ylim(0.0, 1.0)
-    ax.set_ylabel("Test Accuracy")
-    ax.set_title(f"Baseline vs Distillation ({args.label})")
+    acc_values = [summary["baseline_test_acc"], summary["distill_test_acc"]]
+    f1_values = [summary["baseline_test_f1"], summary["distill_test_f1"]]
+
+    axes[0].bar(labels, acc_values, color=["#4C78A8", "#F58518"])
+    axes[0].set_ylim(0.0, 1.0)
+    axes[0].set_ylabel("Score")
+    axes[0].set_title(f"Test Accuracy ({args.label})")
+
+    axes[1].bar(labels, f1_values, color=["#4C78A8", "#F58518"])
+    axes[1].set_ylim(0.0, 1.0)
+    axes[1].set_ylabel("Score")
+    axes[1].set_title(f"Test Macro-F1 ({args.label})")
+
     fig.tight_layout()
     fig.savefig(output_dir / "test_acc_compare.png", dpi=140)
     plt.close(fig)

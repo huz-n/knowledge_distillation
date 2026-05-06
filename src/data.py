@@ -29,6 +29,7 @@ def build_cifar10_loaders(
     batch_size: int = 64,
     num_workers: int = 2,
     image_size: int = 160,
+    augment: str = "basic",
     val_size: int = 5000,
     seed: int = 42,
     max_train_items: Optional[int] = None,
@@ -41,14 +42,36 @@ def build_cifar10_loaders(
     mean = (0.4914, 0.4822, 0.4465)
     std = (0.2023, 0.1994, 0.2010)
 
-    train_tf = transforms.Compose(
-        [
-            transforms.Resize((image_size, image_size)),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=mean, std=std),
-        ]
-    )
+    if augment == "none":
+        train_tf = transforms.Compose(
+            [
+                transforms.Resize((image_size, image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std),
+            ]
+        )
+    elif augment == "strong":
+        train_tf = transforms.Compose(
+            [
+                transforms.Resize((image_size, image_size)),
+                transforms.RandomCrop(image_size, padding=12),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandAugment(num_ops=2, magnitude=9),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std),
+                transforms.RandomErasing(p=0.25, scale=(0.02, 0.2), ratio=(0.3, 3.0)),
+            ]
+        )
+    else:
+        train_tf = transforms.Compose(
+            [
+                transforms.Resize((image_size, image_size)),
+                transforms.RandomCrop(image_size, padding=8),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std),
+            ]
+        )
     eval_tf = transforms.Compose(
         [
             transforms.Resize((image_size, image_size)),
