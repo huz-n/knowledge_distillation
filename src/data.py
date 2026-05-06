@@ -27,9 +27,11 @@ def _maybe_subset(dataset: Dataset, max_items: Optional[int], seed: int) -> Data
 def build_cifar10_loaders(
     data_dir: str | Path,
     batch_size: int = 64,
-    num_workers: int = 2,
+    num_workers: int = 4,
     image_size: int = 160,
     augment: str = "basic",
+    prefetch_factor: int = 4,
+    persistent_workers: bool = True,
     val_size: int = 5000,
     seed: int = 42,
     max_train_items: Optional[int] = None,
@@ -42,18 +44,22 @@ def build_cifar10_loaders(
     mean = (0.4914, 0.4822, 0.4465)
     std = (0.2023, 0.1994, 0.2010)
 
+    resize_step = []
+    if image_size != 32:
+        resize_step = [transforms.Resize((image_size, image_size))]
+
     if augment == "none":
         train_tf = transforms.Compose(
-            [
-                transforms.Resize((image_size, image_size)),
+            resize_step
+            + [
                 transforms.ToTensor(),
                 transforms.Normalize(mean=mean, std=std),
             ]
         )
     elif augment == "strong":
         train_tf = transforms.Compose(
-            [
-                transforms.Resize((image_size, image_size)),
+            resize_step
+            + [
                 transforms.RandomCrop(image_size, padding=12),
                 transforms.RandomHorizontalFlip(),
                 transforms.RandAugment(num_ops=2, magnitude=9),
@@ -64,8 +70,8 @@ def build_cifar10_loaders(
         )
     else:
         train_tf = transforms.Compose(
-            [
-                transforms.Resize((image_size, image_size)),
+            resize_step
+            + [
                 transforms.RandomCrop(image_size, padding=8),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
@@ -73,8 +79,8 @@ def build_cifar10_loaders(
             ]
         )
     eval_tf = transforms.Compose(
-        [
-            transforms.Resize((image_size, image_size)),
+        resize_step
+        + [
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
         ]
@@ -102,26 +108,29 @@ def build_cifar10_loaders(
     test_ds = _maybe_subset(test_ds, max_test_items, seed + 2)
 
     pin_memory = torch.cuda.is_available()
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = persistent_workers
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+
     train_loader = DataLoader(
         train_subset,
-        batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_subset,
-        batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
+        **loader_kwargs,
     )
     test_loader = DataLoader(
         test_ds,
-        batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
+        **loader_kwargs,
     )
 
     return CIFAR10Loaders(train=train_loader, val=val_loader, test=test_loader)

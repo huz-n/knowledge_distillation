@@ -55,7 +55,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--no-persistent-workers", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--val-size", type=int, default=5000)
     parser.add_argument("--max-train-items", type=int, default=0)
@@ -63,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-test-items", type=int, default=0)
     parser.add_argument("--max-train-batches", type=int, default=0)
     parser.add_argument("--max-val-batches", type=int, default=0)
+    parser.add_argument("--channels-last", action="store_true")
     parser.add_argument("--embed-loss", type=str, default="mse", choices=["mse", "cosine"])
     parser.add_argument("--cls-weight", type=float, default=1.0)
     parser.add_argument("--embed-weight", type=float, default=1.0)
@@ -75,6 +78,9 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
 
 def build_embed_loss(name: str) -> nn.Module:
@@ -119,6 +125,7 @@ def run_epoch(
     optimizer: Optional[torch.optim.Optimizer] = None,
     scaler: Optional[torch.amp.GradScaler] = None,
     max_batches: int = 0,
+    channels_last: bool = False,
 ) -> Tuple[float, float, float, float, float, float]:
     training = optimizer is not None
     student.train(training)
@@ -139,6 +146,8 @@ def run_epoch(
         if max_batches > 0 and step >= max_batches:
             break
         x = x.to(device, non_blocking=True)
+        if channels_last and x.ndim == 4:
+            x = x.contiguous(memory_format=torch.channels_last)
         y = y.to(device, non_blocking=True)
         batch_size = y.size(0)
 
@@ -206,6 +215,7 @@ def evaluate_test(
     logit_weight: float,
     temperature: float,
     max_batches: int = 0,
+    channels_last: bool = False,
 ) -> Dict[str, float]:
     test_total, test_cls, test_embed, test_logit, test_acc, test_f1 = run_epoch(
         student=student,
@@ -223,6 +233,7 @@ def evaluate_test(
         optimizer=None,
         scaler=None,
         max_batches=max_batches,
+        channels_last=channels_last,
     )
     return {
         "test_total_loss": test_total,
@@ -294,6 +305,8 @@ def main() -> None:
     teacher = build_model_with_embedding(
         model_name=args.teacher, num_classes=10, pretrained=teacher_pretrained
     ).to(device)
+    if args.channels_last and device.type == "cuda":
+        teacher = teacher.to(memory_format=torch.channels_last)
 
     if args.teacher_checkpoint:
         state = torch.load(args.teacher_checkpoint, map_location=device)
@@ -305,6 +318,8 @@ def main() -> None:
     student = build_model_with_embedding(
         model_name=args.student, num_classes=10, pretrained=False
     ).to(device)
+    if args.channels_last and device.type == "cuda":
+        student = student.to(memory_format=torch.channels_last)
     student_total_params = sum(p.numel() for p in student.parameters())
     student_trainable_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
 
@@ -321,6 +336,8 @@ def main() -> None:
         num_workers=args.num_workers,
         image_size=args.image_size,
         augment=args.augment,
+        prefetch_factor=args.prefetch_factor,
+        persistent_workers=not args.no_persistent_workers,
         val_size=args.val_size,
         seed=args.seed,
         max_train_items=args.max_train_items if args.max_train_items > 0 else None,
@@ -360,6 +377,7 @@ def main() -> None:
             optimizer=optimizer,
             scaler=scaler,
             max_batches=args.max_train_batches,
+            channels_last=args.channels_last,
         )
         val_total, val_cls, val_embed, val_logit, val_acc, val_f1 = run_epoch(
             student=student,
@@ -377,6 +395,7 @@ def main() -> None:
             optimizer=None,
             scaler=None,
             max_batches=args.max_val_batches,
+            channels_last=args.channels_last,
         )
         scheduler.step()
         seconds = time.time() - start
@@ -435,6 +454,7 @@ def main() -> None:
         logit_weight=args.logit_weight,
         temperature=args.temperature,
         max_batches=args.max_val_batches,
+        channels_last=args.channels_last,
     )
 
     plot_curves(history, output_dir / "curves.png")

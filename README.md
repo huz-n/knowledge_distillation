@@ -33,6 +33,18 @@ Current scope:
 4. Run all cells in order.
 5. First run a short pass (`--max-train-batches` / `--max-val-batches`), then scale epochs/batch size.
 
+## Speed Tips (Important)
+
+If training is too slow on Colab T4, use these first:
+1. Set `IMAGE_SIZE=64` in notebook (instead of 160).
+2. Use `AUGMENT='basic'` while tuning; switch to `strong` only for final runs.
+3. Run teacher with `--finetune-mode head_only` for faster teacher checkpoint creation.
+4. Enable `--channels-last` on CUDA runs (already set in notebook defaults).
+5. Reuse cached pretrained weights once per Drive via:
+   - `python -m src.warmup_model_cache --models resnet50 resnet18 mobilenetv3_small`
+
+Expected impact: usually several times faster end-to-end compared to high-resolution + full teacher fine-tuning.
+
 ## Local CLI Usage
 
 ```bash

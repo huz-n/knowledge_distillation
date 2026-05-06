@@ -38,13 +38,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, default="./outputs/teacher_resnet50")
     parser.add_argument("--teacher-model", type=str, default="resnet50")
     parser.add_argument("--teacher-pretrained", action="store_true")
+    parser.add_argument(
+        "--finetune-mode",
+        type=str,
+        default="full",
+        choices=["full", "head_only"],
+        help="full: train all teacher parameters; head_only: train only classifier layer.",
+    )
     parser.add_argument("--image-size", type=int, default=160)
     parser.add_argument("--augment", type=str, default="basic", choices=["none", "basic", "strong"])
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--no-persistent-workers", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--val-size", type=int, default=5000)
     parser.add_argument("--max-train-items", type=int, default=0)
@@ -52,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-test-items", type=int, default=0)
     parser.add_argument("--max-train-batches", type=int, default=0)
     parser.add_argument("--max-val-batches", type=int, default=0)
+    parser.add_argument("--channels-last", action="store_true")
     return parser.parse_args()
 
 
@@ -59,6 +69,9 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
 
 def run_epoch(
@@ -69,6 +82,7 @@ def run_epoch(
     optimizer: Optional[torch.optim.Optimizer] = None,
     scaler: Optional[torch.amp.GradScaler] = None,
     max_batches: int = 0,
+    channels_last: bool = False,
 ) -> Tuple[float, float, float]:
     training = optimizer is not None
     model.train(training)
@@ -83,6 +97,8 @@ def run_epoch(
         if max_batches > 0 and step >= max_batches:
             break
         x = x.to(device, non_blocking=True)
+        if channels_last and x.ndim == 4:
+            x = x.contiguous(memory_format=torch.channels_last)
         y = y.to(device, non_blocking=True)
         if training:
             optimizer.zero_grad(set_to_none=True)
@@ -153,6 +169,11 @@ def main() -> None:
     model = build_model_with_embedding(
         model_name=args.teacher_model, num_classes=10, pretrained=args.teacher_pretrained
     ).to(device)
+    if args.channels_last and device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
+    if args.finetune_mode == "head_only":
+        for p in model.features.parameters():
+            p.requires_grad = False
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -162,6 +183,8 @@ def main() -> None:
         num_workers=args.num_workers,
         image_size=args.image_size,
         augment=args.augment,
+        prefetch_factor=args.prefetch_factor,
+        persistent_workers=not args.no_persistent_workers,
         val_size=args.val_size,
         seed=args.seed,
         max_train_items=args.max_train_items if args.max_train_items > 0 else None,
@@ -170,7 +193,8 @@ def main() -> None:
     )
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    trainable_params_iter = [p for p in model.parameters() if p.requires_grad]
+    optimizer = AdamW(trainable_params_iter, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=max(1, args.epochs))
     scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
 
@@ -188,6 +212,7 @@ def main() -> None:
             optimizer=optimizer,
             scaler=scaler,
             max_batches=args.max_train_batches,
+            channels_last=args.channels_last,
         )
         val_loss, val_acc, val_f1 = run_epoch(
             model=model,
@@ -197,6 +222,7 @@ def main() -> None:
             optimizer=None,
             scaler=None,
             max_batches=args.max_val_batches,
+            channels_last=args.channels_last,
         )
         scheduler.step()
         elapsed = time.time() - start
@@ -237,6 +263,7 @@ def main() -> None:
         "device": str(device),
         "teacher_model": args.teacher_model,
         "augment": args.augment,
+        "finetune_mode": args.finetune_mode,
         "model_total_params": total_params,
         "model_trainable_params": trainable_params,
         "history": [asdict(h) for h in history],
