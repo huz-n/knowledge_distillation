@@ -62,6 +62,26 @@ def _build_mobilenetv3_small_with_embedding(
     return ClassifierWithEmbedding(features=features, classifier=classifier, embedding_dim=embedding_dim)
 
 
+def _build_tiny_cnn_with_embedding(num_classes: int) -> ClassifierWithEmbedding:
+    features = nn.Sequential(
+        nn.Conv2d(3, 32, kernel_size=3, padding=1),
+        nn.BatchNorm2d(32),
+        nn.ReLU(inplace=True),
+        nn.MaxPool2d(2),
+        nn.Conv2d(32, 64, kernel_size=3, padding=1),
+        nn.BatchNorm2d(64),
+        nn.ReLU(inplace=True),
+        nn.MaxPool2d(2),
+        nn.Conv2d(64, 128, kernel_size=3, padding=1),
+        nn.BatchNorm2d(128),
+        nn.ReLU(inplace=True),
+        nn.AdaptiveAvgPool2d((1, 1)),
+    )
+    embedding_dim = 128
+    classifier = nn.Linear(embedding_dim, num_classes)
+    return ClassifierWithEmbedding(features=features, classifier=classifier, embedding_dim=embedding_dim)
+
+
 def build_model_with_embedding(
     model_name: str, num_classes: int = 10, pretrained: bool = False
 ) -> ClassifierWithEmbedding:
@@ -70,6 +90,8 @@ def build_model_with_embedding(
         return _build_resnet_with_embedding(name=name, num_classes=num_classes, pretrained=pretrained)
     if name in {"mobilenetv3_small", "mobilenet_v3_small"}:
         return _build_mobilenetv3_small_with_embedding(num_classes=num_classes, pretrained=pretrained)
+    if name in {"tiny_cnn", "small_cnn"}:
+        return _build_tiny_cnn_with_embedding(num_classes=num_classes)
     raise ValueError(f"Unsupported model_name: {model_name}")
 
 
@@ -85,6 +107,8 @@ def build_teacher_resnet50(num_classes: int = 10) -> nn.Module:
 
 def build_student(student_name: str, num_classes: int = 10, pretrained: bool = False) -> nn.Module:
     name = student_name.lower()
+    if name in {"tiny_cnn", "small_cnn"}:
+        return _build_tiny_cnn_with_embedding(num_classes=num_classes)
     if name == "resnet18":
         weights = ResNet18_Weights.DEFAULT if pretrained else None
         model = resnet18(weights=weights)

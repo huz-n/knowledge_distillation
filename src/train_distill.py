@@ -15,7 +15,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm.auto import tqdm
 
-from src.data import build_cifar10_loaders
+from src.data import build_image_classification_loaders
 from src.metrics import RunningClassificationMetrics
 from src.models import build_model_with_embedding
 
@@ -41,9 +41,15 @@ class EpochMetrics:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="CIFAR-10 student training with embedding/logit distillation."
+        description="Student training with embedding/logit distillation."
     )
     parser.add_argument("--data-dir", type=str, default="./data")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="cifar10",
+        choices=["cifar10", "cifar100", "tiny_imagenet"],
+    )
     parser.add_argument("--output-dir", type=str, default="./outputs/distill")
     parser.add_argument("--student", type=str, default="resnet18")
     parser.add_argument("--teacher", type=str, default="resnet50")
@@ -126,6 +132,7 @@ def run_epoch(
     scaler: Optional[torch.amp.GradScaler] = None,
     max_batches: int = 0,
     channels_last: bool = False,
+    num_classes: int = 10,
 ) -> Tuple[float, float, float, float, float, float]:
     training = optimizer is not None
     student.train(training)
@@ -137,7 +144,7 @@ def run_epoch(
     total_cls_loss = 0.0
     total_embed_loss = 0.0
     total_logit_loss = 0.0
-    metrics = RunningClassificationMetrics(num_classes=10)
+    metrics = RunningClassificationMetrics(num_classes=num_classes)
 
     autocast_enabled = device.type == "cuda"
     iterator = tqdm(loader, leave=False, desc="train" if training else "eval")
@@ -219,6 +226,7 @@ def evaluate_test(
     temperature: float,
     max_batches: int = 0,
     channels_last: bool = False,
+    num_classes: int = 10,
 ) -> Dict[str, float]:
     test_total, test_cls, test_embed, test_logit, test_acc, test_f1 = run_epoch(
         student=student,
@@ -237,6 +245,7 @@ def evaluate_test(
         scaler=None,
         max_batches=max_batches,
         channels_last=channels_last,
+        num_classes=num_classes,
     )
     return {
         "test_total_loss": test_total,
@@ -304,40 +313,8 @@ def main() -> None:
         raise ValueError("At least one of --cls-weight / --embed-weight / --logit-weight must be > 0.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    teacher_pretrained = args.teacher_pretrained or not bool(args.teacher_checkpoint)
-    teacher = build_model_with_embedding(
-        model_name=args.teacher, num_classes=10, pretrained=teacher_pretrained
-    ).to(device)
-    if args.channels_last and device.type == "cuda":
-        teacher = teacher.to(memory_format=torch.channels_last)
-
-    if args.teacher_checkpoint:
-        state = torch.load(args.teacher_checkpoint, map_location=device)
-        teacher.load_state_dict(state["model"] if "model" in state else state, strict=False)
-    for param in teacher.parameters():
-        param.requires_grad = False
-    teacher.eval()
-
-    student = build_model_with_embedding(
-        model_name=args.student, num_classes=10, pretrained=False
-    ).to(device)
-    if args.channels_last and device.type == "cuda":
-        student = student.to(memory_format=torch.channels_last)
-    student_total_params = sum(p.numel() for p in student.parameters())
-    student_trainable_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
-
-    if student.embedding_dim == teacher.embedding_dim:
-        projector: nn.Module = nn.Identity()
-    else:
-        projector = nn.Sequential(
-            nn.Linear(512, 1024),
-            nn.ReLU(),
-            nn.Linear(1024, 2048)
-        )
-    projector = projector.to(device)
-    projector_total_params = sum(p.numel() for p in projector.parameters())
-
-    loaders = build_cifar10_loaders(
+    loaders = build_image_classification_loaders(
+        dataset_name=args.dataset,
         data_dir=args.data_dir,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -351,6 +328,41 @@ def main() -> None:
         max_val_items=args.max_val_items if args.max_val_items > 0 else None,
         max_test_items=args.max_test_items if args.max_test_items > 0 else None,
     )
+    num_classes = loaders.num_classes
+
+    teacher_pretrained = args.teacher_pretrained or not bool(args.teacher_checkpoint)
+    teacher = build_model_with_embedding(
+        model_name=args.teacher, num_classes=num_classes, pretrained=teacher_pretrained
+    ).to(device)
+    if args.channels_last and device.type == "cuda":
+        teacher = teacher.to(memory_format=torch.channels_last)
+
+    if args.teacher_checkpoint:
+        state = torch.load(args.teacher_checkpoint, map_location=device)
+        teacher.load_state_dict(state["model"] if "model" in state else state, strict=False)
+    for param in teacher.parameters():
+        param.requires_grad = False
+    teacher.eval()
+
+    student = build_model_with_embedding(
+        model_name=args.student, num_classes=num_classes, pretrained=False
+    ).to(device)
+    if args.channels_last and device.type == "cuda":
+        student = student.to(memory_format=torch.channels_last)
+    student_total_params = sum(p.numel() for p in student.parameters())
+    student_trainable_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
+
+    if student.embedding_dim == teacher.embedding_dim:
+        projector: nn.Module = nn.Identity()
+    else:
+        hidden_dim = max(student.embedding_dim * 2, teacher.embedding_dim)
+        projector = nn.Sequential(
+            nn.Linear(student.embedding_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, teacher.embedding_dim),
+        )
+    projector = projector.to(device)
+    projector_total_params = sum(p.numel() for p in projector.parameters())
 
     cls_criterion = nn.CrossEntropyLoss()
     embed_criterion = build_embed_loss(args.embed_loss)
@@ -385,6 +397,7 @@ def main() -> None:
             scaler=scaler,
             max_batches=args.max_train_batches,
             channels_last=args.channels_last,
+            num_classes=num_classes,
         )
         val_total, val_cls, val_embed, val_logit, val_acc, val_f1 = run_epoch(
             student=student,
@@ -403,6 +416,7 @@ def main() -> None:
             scaler=None,
             max_batches=args.max_val_batches,
             channels_last=args.channels_last,
+            num_classes=num_classes,
         )
         scheduler.step()
         seconds = time.time() - start
@@ -462,6 +476,7 @@ def main() -> None:
         temperature=args.temperature,
         max_batches=args.max_val_batches,
         channels_last=args.channels_last,
+        num_classes=num_classes,
     )
 
     plot_curves(history, output_dir / "curves.png")
@@ -469,6 +484,7 @@ def main() -> None:
         "args": vars(args),
         "device": str(device),
         "teacher_model": args.teacher,
+        "dataset": args.dataset,
         "teacher_checkpoint_used": bool(args.teacher_checkpoint),
         "augment": args.augment,
         "student_embedding_dim": student.embedding_dim,

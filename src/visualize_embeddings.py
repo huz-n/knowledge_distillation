@@ -11,7 +11,7 @@ import torch
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
-from src.data import build_cifar10_loaders
+from src.data import build_image_classification_loaders
 from src.models import build_model_with_embedding
 
 
@@ -20,6 +20,12 @@ def parse_args() -> argparse.Namespace:
         description="Visualize teacher vs baseline vs distillation embeddings."
     )
     parser.add_argument("--data-dir", type=str, default="./data")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="cifar10",
+        choices=["cifar10", "cifar100", "tiny_imagenet"],
+    )
     parser.add_argument("--output-dir", type=str, default="./outputs/embedding_viz")
     parser.add_argument("--student-model", type=str, default="resnet18")
     parser.add_argument("--teacher-model", type=str, default="resnet50")
@@ -51,10 +57,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_teacher(device: torch.device, args: argparse.Namespace) -> torch.nn.Module:
+def load_teacher(device: torch.device, args: argparse.Namespace, num_classes: int) -> torch.nn.Module:
     teacher_pretrained = args.teacher_pretrained or not bool(args.teacher_checkpoint)
     model = build_model_with_embedding(
-        model_name=args.teacher_model, num_classes=10, pretrained=teacher_pretrained
+        model_name=args.teacher_model, num_classes=num_classes, pretrained=teacher_pretrained
     ).to(device)
     if args.teacher_checkpoint:
         state = torch.load(args.teacher_checkpoint, map_location=device)
@@ -65,8 +71,10 @@ def load_teacher(device: torch.device, args: argparse.Namespace) -> torch.nn.Mod
     return model
 
 
-def load_baseline_student(device: torch.device, args: argparse.Namespace) -> torch.nn.Module:
-    model = build_model_with_embedding(model_name=args.student_model, num_classes=10, pretrained=False).to(
+def load_baseline_student(
+    device: torch.device, args: argparse.Namespace, num_classes: int
+) -> torch.nn.Module:
+    model = build_model_with_embedding(model_name=args.student_model, num_classes=num_classes, pretrained=False).to(
         device
     )
     state = torch.load(args.baseline_checkpoint, map_location=device)
@@ -76,9 +84,9 @@ def load_baseline_student(device: torch.device, args: argparse.Namespace) -> tor
 
 
 def load_distill_student(
-    device: torch.device, args: argparse.Namespace, teacher_emb_dim: int
+    device: torch.device, args: argparse.Namespace, teacher_emb_dim: int, num_classes: int
 ) -> Tuple[torch.nn.Module, torch.nn.Module]:
-    model = build_model_with_embedding(model_name=args.student_model, num_classes=10, pretrained=False).to(
+    model = build_model_with_embedding(model_name=args.student_model, num_classes=num_classes, pretrained=False).to(
         device
     )
     if model.embedding_dim == teacher_emb_dim:
@@ -232,13 +240,8 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
 
-    teacher = load_teacher(device=device, args=args)
-    baseline_student = load_baseline_student(device=device, args=args)
-    distill_student, distill_projector = load_distill_student(
-        device=device, args=args, teacher_emb_dim=teacher.embedding_dim
-    )
-
-    loaders = build_cifar10_loaders(
+    loaders = build_image_classification_loaders(
+        dataset_name=args.dataset,
         data_dir=args.data_dir,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -247,6 +250,13 @@ def main() -> None:
         val_size=args.val_size,
         seed=args.seed,
         max_test_items=args.max_items,
+    )
+    num_classes = loaders.num_classes
+
+    teacher = load_teacher(device=device, args=args, num_classes=num_classes)
+    baseline_student = load_baseline_student(device=device, args=args, num_classes=num_classes)
+    distill_student, distill_projector = load_distill_student(
+        device=device, args=args, teacher_emb_dim=teacher.embedding_dim, num_classes=num_classes
     )
     bundle = collect_embeddings(
         teacher=teacher,

@@ -14,7 +14,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm.auto import tqdm
 
-from src.data import build_cifar10_loaders
+from src.data import build_image_classification_loaders
 from src.metrics import RunningClassificationMetrics
 from src.models import build_model_with_embedding, build_teacher_resnet50
 
@@ -33,8 +33,14 @@ class EpochMetrics:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="CIFAR-10 baseline student training (Colab-first).")
+    parser = argparse.ArgumentParser(description="Baseline student training for image classification.")
     parser.add_argument("--data-dir", type=str, default="./data")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="cifar10",
+        choices=["cifar10", "cifar100", "tiny_imagenet"],
+    )
     parser.add_argument("--output-dir", type=str, default="./outputs/baseline")
     parser.add_argument("--student", type=str, default="resnet18")
     parser.add_argument("--image-size", type=int, default=160)
@@ -83,13 +89,14 @@ def run_epoch(
     scaler: Optional[torch.amp.GradScaler] = None,
     max_batches: int = 0,
     channels_last: bool = False,
+    num_classes: int = 10,
 ) -> Tuple[float, float, float]:
     training = optimizer is not None
     model.train(training)
 
     total_loss = 0.0
     total_items = 0
-    metrics = RunningClassificationMetrics(num_classes=10)
+    metrics = RunningClassificationMetrics(num_classes=num_classes)
 
     autocast_enabled = device.type == "cuda"
     iterator = tqdm(loader, leave=False, desc="train" if training else "eval")
@@ -136,6 +143,7 @@ def evaluate_test(
     criterion: nn.Module,
     max_batches: int = 0,
     channels_last: bool = False,
+    num_classes: int = 10,
 ) -> Dict[str, float]:
     test_loss, test_acc, test_f1 = run_epoch(
         model=model,
@@ -146,6 +154,7 @@ def evaluate_test(
         scaler=None,
         max_batches=max_batches,
         channels_last=channels_last,
+        num_classes=num_classes,
     )
     return {"test_loss": test_loss, "test_acc": test_acc, "test_f1": test_f1}
 
@@ -183,8 +192,8 @@ def plot_curves(history: List[EpochMetrics], output_path: Path) -> None:
     plt.close(fig)
 
 
-def maybe_load_teacher(device: torch.device, checkpoint: str = "") -> None:
-    teacher = build_teacher_resnet50(num_classes=10)
+def maybe_load_teacher(device: torch.device, num_classes: int, checkpoint: str = "") -> None:
+    teacher = build_teacher_resnet50(num_classes=num_classes)
     teacher.to(device)
     if checkpoint:
         state = torch.load(checkpoint, map_location=device)
@@ -200,10 +209,8 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if args.load_teacher:
-        maybe_load_teacher(device=device, checkpoint=args.teacher_checkpoint)
-
-    loaders = build_cifar10_loaders(
+    loaders = build_image_classification_loaders(
+        dataset_name=args.dataset,
         data_dir=args.data_dir,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -217,9 +224,12 @@ def main() -> None:
         max_val_items=args.max_val_items if args.max_val_items > 0 else None,
         max_test_items=args.max_test_items if args.max_test_items > 0 else None,
     )
+    num_classes = loaders.num_classes
+    if args.load_teacher:
+        maybe_load_teacher(device=device, num_classes=num_classes, checkpoint=args.teacher_checkpoint)
 
     model = build_model_with_embedding(
-        model_name=args.student, num_classes=10, pretrained=False
+        model_name=args.student, num_classes=num_classes, pretrained=False
     ).to(device)
     if args.channels_last and device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)
@@ -246,6 +256,7 @@ def main() -> None:
             scaler=scaler,
             max_batches=args.max_train_batches,
             channels_last=args.channels_last,
+            num_classes=num_classes,
         )
         val_loss, val_acc, val_f1 = run_epoch(
             model=model,
@@ -256,6 +267,7 @@ def main() -> None:
             scaler=None,
             max_batches=args.max_val_batches,
             channels_last=args.channels_last,
+            num_classes=num_classes,
         )
         scheduler.step()
         seconds = time.time() - start
@@ -298,6 +310,7 @@ def main() -> None:
         criterion=criterion,
         max_batches=args.max_val_batches,
         channels_last=args.channels_last,
+        num_classes=num_classes,
     )
 
     plot_curves(history, output_dir / "curves.png")
@@ -306,6 +319,7 @@ def main() -> None:
         "args": vars(args),
         "device": str(device),
         "student_model": args.student,
+        "dataset": args.dataset,
         "augment": args.augment,
         "model_total_params": model_total_params,
         "model_trainable_params": model_trainable_params,

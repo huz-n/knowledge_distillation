@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import shutil
+import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -9,11 +12,16 @@ from torch.utils.data import DataLoader, Dataset, Subset, random_split
 from torchvision import datasets, transforms
 
 
+TINY_IMAGENET_URL = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
+
+
 @dataclass
-class CIFAR10Loaders:
+class DatasetLoaders:
     train: DataLoader
     val: DataLoader
     test: DataLoader
+    num_classes: int
+    dataset_name: str
 
 
 def _maybe_subset(dataset: Dataset, max_items: Optional[int], seed: int) -> Dataset:
@@ -24,28 +32,40 @@ def _maybe_subset(dataset: Dataset, max_items: Optional[int], seed: int) -> Data
     return Subset(dataset, indices)
 
 
-def build_cifar10_loaders(
-    data_dir: str | Path,
-    batch_size: int = 64,
-    num_workers: int = 4,
-    image_size: int = 160,
-    augment: str = "basic",
-    prefetch_factor: int = 4,
-    persistent_workers: bool = True,
-    val_size: int = 5000,
-    seed: int = 42,
-    max_train_items: Optional[int] = None,
-    max_val_items: Optional[int] = None,
-    max_test_items: Optional[int] = None,
-) -> CIFAR10Loaders:
-    data_dir = Path(data_dir)
-    data_dir.mkdir(parents=True, exist_ok=True)
+def _build_loader_kwargs(
+    batch_size: int,
+    num_workers: int,
+    prefetch_factor: int,
+    persistent_workers: bool,
+) -> dict:
+    pin_memory = torch.cuda.is_available()
+    kwargs = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = persistent_workers
+        kwargs["prefetch_factor"] = prefetch_factor
+    return kwargs
 
-    mean = (0.4914, 0.4822, 0.4465)
-    std = (0.2023, 0.1994, 0.2010)
+
+def _build_transforms(
+    dataset_name: str,
+    image_size: int,
+    augment: str,
+) -> tuple[transforms.Compose, transforms.Compose]:
+    if dataset_name.lower() in {"cifar10", "cifar100"}:
+        mean = (0.4914, 0.4822, 0.4465)
+        std = (0.2023, 0.1994, 0.2010)
+        base_size = 32
+    else:
+        mean = (0.485, 0.456, 0.406)
+        std = (0.229, 0.224, 0.225)
+        base_size = 64
 
     resize_step = []
-    if image_size != 32:
+    if image_size != base_size:
         resize_step = [transforms.Resize((image_size, image_size))]
 
     if augment == "none":
@@ -60,7 +80,7 @@ def build_cifar10_loaders(
         train_tf = transforms.Compose(
             resize_step
             + [
-                transforms.RandomCrop(image_size, padding=12),
+                transforms.RandomCrop(image_size, padding=max(4, image_size // 8)),
                 transforms.RandomHorizontalFlip(),
                 transforms.RandAugment(num_ops=2, magnitude=9),
                 transforms.ToTensor(),
@@ -72,12 +92,13 @@ def build_cifar10_loaders(
         train_tf = transforms.Compose(
             resize_step
             + [
-                transforms.RandomCrop(image_size, padding=8),
+                transforms.RandomCrop(image_size, padding=max(4, image_size // 8)),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=mean, std=std),
             ]
         )
+
     eval_tf = transforms.Compose(
         resize_step
         + [
@@ -85,12 +106,87 @@ def build_cifar10_loaders(
             transforms.Normalize(mean=mean, std=std),
         ]
     )
+    return train_tf, eval_tf
 
-    full_train = datasets.CIFAR10(root=str(data_dir), train=True, download=True, transform=train_tf)
-    full_train_eval = datasets.CIFAR10(
-        root=str(data_dir), train=True, download=False, transform=eval_tf
-    )
-    test_ds = datasets.CIFAR10(root=str(data_dir), train=False, download=True, transform=eval_tf)
+
+def _download_tiny_imagenet_if_needed(data_dir: Path) -> Path:
+    tiny_root = data_dir / "tiny-imagenet-200"
+    train_dir = tiny_root / "train"
+    if train_dir.exists():
+        return tiny_root
+
+    zip_path = data_dir / "tiny-imagenet-200.zip"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    if not zip_path.exists():
+        print(f"Downloading Tiny ImageNet from {TINY_IMAGENET_URL} ...")
+        urllib.request.urlretrieve(TINY_IMAGENET_URL, zip_path)
+
+    print("Extracting Tiny ImageNet ...")
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(data_dir)
+    return tiny_root
+
+
+def _prepare_tiny_imagenet_val_folder(tiny_root: Path) -> Path:
+    # Creates a class-subfolder structure from val annotations if needed.
+    source_val = tiny_root / "val"
+    source_images = source_val / "images"
+    ann_file = source_val / "val_annotations.txt"
+    organized_val = tiny_root / "val_by_class"
+
+    if organized_val.exists():
+        return organized_val
+    organized_val.mkdir(parents=True, exist_ok=True)
+
+    if not ann_file.exists():
+        raise FileNotFoundError(f"Missing Tiny ImageNet annotations: {ann_file}")
+
+    mapping: dict[str, str] = {}
+    with ann_file.open("r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) >= 2:
+                mapping[parts[0]] = parts[1]
+
+    for img_name, class_id in mapping.items():
+        class_dir = organized_val / class_id
+        class_dir.mkdir(parents=True, exist_ok=True)
+        src = source_images / img_name
+        dst = class_dir / img_name
+        if src.exists() and not dst.exists():
+            shutil.copy2(src, dst)
+
+    return organized_val
+
+
+def _build_cifar_loaders(
+    dataset_name: str,
+    data_dir: Path,
+    train_tf: transforms.Compose,
+    eval_tf: transforms.Compose,
+    batch_size: int,
+    num_workers: int,
+    prefetch_factor: int,
+    persistent_workers: bool,
+    val_size: int,
+    seed: int,
+    max_train_items: Optional[int],
+    max_val_items: Optional[int],
+    max_test_items: Optional[int],
+) -> DatasetLoaders:
+    name = dataset_name.lower()
+    if name == "cifar10":
+        ds_cls = datasets.CIFAR10
+        num_classes = 10
+    elif name == "cifar100":
+        ds_cls = datasets.CIFAR100
+        num_classes = 100
+    else:
+        raise ValueError(f"Unsupported CIFAR dataset: {dataset_name}")
+
+    full_train = ds_cls(root=str(data_dir), train=True, download=True, transform=train_tf)
+    full_train_eval = ds_cls(root=str(data_dir), train=True, download=False, transform=eval_tf)
+    test_ds = ds_cls(root=str(data_dir), train=False, download=True, transform=eval_tf)
 
     if val_size <= 0 or val_size >= len(full_train):
         raise ValueError(f"val_size must be in [1, {len(full_train)-1}]")
@@ -98,8 +194,6 @@ def build_cifar10_loaders(
     train_size = len(full_train) - val_size
     gen = torch.Generator().manual_seed(seed)
     train_subset, val_subset_idx = random_split(full_train, [train_size, val_size], generator=gen)
-
-    # Rebuild val subset on eval transform (no augmentation).
     val_indices = val_subset_idx.indices  # type: ignore[attr-defined]
     val_subset = Subset(full_train_eval, val_indices)
 
@@ -107,30 +201,127 @@ def build_cifar10_loaders(
     val_subset = _maybe_subset(val_subset, max_val_items, seed + 1)
     test_ds = _maybe_subset(test_ds, max_test_items, seed + 2)
 
-    pin_memory = torch.cuda.is_available()
-    loader_kwargs = {
-        "batch_size": batch_size,
-        "num_workers": num_workers,
-        "pin_memory": pin_memory,
-    }
-    if num_workers > 0:
-        loader_kwargs["persistent_workers"] = persistent_workers
-        loader_kwargs["prefetch_factor"] = prefetch_factor
-
-    train_loader = DataLoader(
-        train_subset,
-        shuffle=True,
-        **loader_kwargs,
+    loader_kwargs = _build_loader_kwargs(
+        batch_size=batch_size,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers,
     )
-    val_loader = DataLoader(
-        val_subset,
-        shuffle=False,
-        **loader_kwargs,
-    )
-    test_loader = DataLoader(
-        test_ds,
-        shuffle=False,
-        **loader_kwargs,
+    train_loader = DataLoader(train_subset, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_subset, shuffle=False, **loader_kwargs)
+    test_loader = DataLoader(test_ds, shuffle=False, **loader_kwargs)
+    return DatasetLoaders(
+        train=train_loader,
+        val=val_loader,
+        test=test_loader,
+        num_classes=num_classes,
+        dataset_name=dataset_name,
     )
 
-    return CIFAR10Loaders(train=train_loader, val=val_loader, test=test_loader)
+
+def _build_tiny_imagenet_loaders(
+    data_dir: Path,
+    train_tf: transforms.Compose,
+    eval_tf: transforms.Compose,
+    batch_size: int,
+    num_workers: int,
+    prefetch_factor: int,
+    persistent_workers: bool,
+    val_size: int,
+    seed: int,
+    max_train_items: Optional[int],
+    max_val_items: Optional[int],
+    max_test_items: Optional[int],
+) -> DatasetLoaders:
+    tiny_root = _download_tiny_imagenet_if_needed(data_dir)
+    val_dir = _prepare_tiny_imagenet_val_folder(tiny_root)
+
+    train_dir = tiny_root / "train"
+    full_train = datasets.ImageFolder(root=str(train_dir), transform=train_tf)
+    full_train_eval = datasets.ImageFolder(root=str(train_dir), transform=eval_tf)
+    test_ds = datasets.ImageFolder(root=str(val_dir), transform=eval_tf)
+    num_classes = len(full_train.classes)
+
+    if val_size <= 0 or val_size >= len(full_train):
+        raise ValueError(f"val_size must be in [1, {len(full_train)-1}] for tiny_imagenet")
+
+    train_size = len(full_train) - val_size
+    gen = torch.Generator().manual_seed(seed)
+    train_subset, val_subset_idx = random_split(full_train, [train_size, val_size], generator=gen)
+    val_indices = val_subset_idx.indices  # type: ignore[attr-defined]
+    val_subset = Subset(full_train_eval, val_indices)
+
+    train_subset = _maybe_subset(train_subset, max_train_items, seed)
+    val_subset = _maybe_subset(val_subset, max_val_items, seed + 1)
+    test_ds = _maybe_subset(test_ds, max_test_items, seed + 2)
+
+    loader_kwargs = _build_loader_kwargs(
+        batch_size=batch_size,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers,
+    )
+    train_loader = DataLoader(train_subset, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_subset, shuffle=False, **loader_kwargs)
+    test_loader = DataLoader(test_ds, shuffle=False, **loader_kwargs)
+    return DatasetLoaders(
+        train=train_loader,
+        val=val_loader,
+        test=test_loader,
+        num_classes=num_classes,
+        dataset_name="tiny_imagenet",
+    )
+
+
+def build_image_classification_loaders(
+    dataset_name: str,
+    data_dir: str | Path,
+    batch_size: int = 64,
+    num_workers: int = 4,
+    image_size: int = 160,
+    augment: str = "basic",
+    prefetch_factor: int = 4,
+    persistent_workers: bool = True,
+    val_size: int = 5000,
+    seed: int = 42,
+    max_train_items: Optional[int] = None,
+    max_val_items: Optional[int] = None,
+    max_test_items: Optional[int] = None,
+) -> DatasetLoaders:
+    name = dataset_name.lower()
+    data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    train_tf, eval_tf = _build_transforms(dataset_name=name, image_size=image_size, augment=augment)
+
+    if name in {"cifar10", "cifar100"}:
+        return _build_cifar_loaders(
+            dataset_name=name,
+            data_dir=data_dir,
+            train_tf=train_tf,
+            eval_tf=eval_tf,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
+            val_size=val_size,
+            seed=seed,
+            max_train_items=max_train_items,
+            max_val_items=max_val_items,
+            max_test_items=max_test_items,
+        )
+    if name in {"tiny_imagenet", "tiny-imagenet", "tinyimagenet"}:
+        return _build_tiny_imagenet_loaders(
+            data_dir=data_dir,
+            train_tf=train_tf,
+            eval_tf=eval_tf,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
+            val_size=val_size,
+            seed=seed,
+            max_train_items=max_train_items,
+            max_val_items=max_val_items,
+            max_test_items=max_test_items,
+        )
+    raise ValueError(f"Unsupported dataset_name: {dataset_name}")

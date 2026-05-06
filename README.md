@@ -3,9 +3,15 @@
 This repository includes a full experimental workflow for CIFAR-10 knowledge distillation with presentation-ready outputs.
 
 Current scope:
-- Dataset: CIFAR-10
-- Teacher: ResNet-50 trained on CIFAR-10, then frozen for distillation
-- Student: ResNet-18 or MobileNetV3-small
+- Datasets:
+  - CIFAR-10
+  - CIFAR-100
+  - Tiny ImageNet (auto-download + preparation)
+- Teacher: ResNet-50 trained on the selected dataset, then frozen for distillation
+- Student options:
+  - ResNet-18
+  - MobileNetV3-small
+  - Tiny CNN (`tiny_cnn`) for low-capacity baselines
 - Training:
   - baseline supervised (cross-entropy)
   - embedding distillation (`mse` or `cosine`)
@@ -25,13 +31,14 @@ Current scope:
 
 1. Open `notebooks/colab_baseline_runner.ipynb` in Colab for a smoke test.
 2. Open `notebooks/colab_distill_runner.ipynb` for full experiments.
-3. Both notebooks mount Google Drive and cache everything under:
+3. For harder experiments with larger teacher-student gap, open `notebooks/colab_tiny_imagenet_runner.ipynb`.
+4. Notebooks mount Google Drive and cache everything under:
    - `/content/drive/MyDrive/PSI_main/knowledge_distillation` (repo)
    - `/content/drive/MyDrive/PSI_main/data` (dataset)
    - `/content/drive/MyDrive/PSI_main/cache` (torch/pip/hf caches)
    - `/content/drive/MyDrive/PSI_main/outputs` (all run artifacts)
-4. Run all cells in order.
-5. First run a short pass (`--max-train-batches` / `--max-val-batches`), then scale epochs/batch size.
+5. Run all cells in order.
+6. First run a short pass (`--max-train-batches` / `--max-val-batches`), then scale epochs/batch size.
 
 ## Speed Tips (Important)
 

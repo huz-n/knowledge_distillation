@@ -14,7 +14,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm.auto import tqdm
 
-from src.data import build_cifar10_loaders
+from src.data import build_image_classification_loaders
 from src.metrics import RunningClassificationMetrics
 from src.models import build_model_with_embedding
 
@@ -33,8 +33,14 @@ class EpochMetrics:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a CIFAR teacher checkpoint.")
+    parser = argparse.ArgumentParser(description="Train a teacher checkpoint for image classification.")
     parser.add_argument("--data-dir", type=str, default="./data")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="cifar10",
+        choices=["cifar10", "cifar100", "tiny_imagenet"],
+    )
     parser.add_argument("--output-dir", type=str, default="./outputs/teacher_resnet50")
     parser.add_argument("--teacher-model", type=str, default="resnet50")
     parser.add_argument("--teacher-pretrained", action="store_true")
@@ -83,13 +89,14 @@ def run_epoch(
     scaler: Optional[torch.amp.GradScaler] = None,
     max_batches: int = 0,
     channels_last: bool = False,
+    num_classes: int = 10,
 ) -> Tuple[float, float, float]:
     training = optimizer is not None
     model.train(training)
 
     total_loss = 0.0
     total_items = 0
-    metrics = RunningClassificationMetrics(num_classes=10)
+    metrics = RunningClassificationMetrics(num_classes=num_classes)
     autocast_enabled = device.type == "cuda"
     iterator = tqdm(loader, leave=False, desc="train" if training else "eval")
 
@@ -166,18 +173,8 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_model_with_embedding(
-        model_name=args.teacher_model, num_classes=10, pretrained=args.teacher_pretrained
-    ).to(device)
-    if args.channels_last and device.type == "cuda":
-        model = model.to(memory_format=torch.channels_last)
-    if args.finetune_mode == "head_only":
-        for p in model.features.parameters():
-            p.requires_grad = False
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    loaders = build_cifar10_loaders(
+    loaders = build_image_classification_loaders(
+        dataset_name=args.dataset,
         data_dir=args.data_dir,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -191,6 +188,18 @@ def main() -> None:
         max_val_items=args.max_val_items if args.max_val_items > 0 else None,
         max_test_items=args.max_test_items if args.max_test_items > 0 else None,
     )
+    num_classes = loaders.num_classes
+
+    model = build_model_with_embedding(
+        model_name=args.teacher_model, num_classes=num_classes, pretrained=args.teacher_pretrained
+    ).to(device)
+    if args.channels_last and device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
+    if args.finetune_mode == "head_only":
+        for p in model.features.parameters():
+            p.requires_grad = False
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     criterion = nn.CrossEntropyLoss()
     trainable_params_iter = [p for p in model.parameters() if p.requires_grad]
@@ -213,6 +222,7 @@ def main() -> None:
             scaler=scaler,
             max_batches=args.max_train_batches,
             channels_last=args.channels_last,
+            num_classes=num_classes,
         )
         val_loss, val_acc, val_f1 = run_epoch(
             model=model,
@@ -223,6 +233,7 @@ def main() -> None:
             scaler=None,
             max_batches=args.max_val_batches,
             channels_last=args.channels_last,
+            num_classes=num_classes,
         )
         scheduler.step()
         elapsed = time.time() - start
@@ -262,6 +273,7 @@ def main() -> None:
         "args": vars(args),
         "device": str(device),
         "teacher_model": args.teacher_model,
+        "dataset": args.dataset,
         "augment": args.augment,
         "finetune_mode": args.finetune_mode,
         "model_total_params": total_params,
