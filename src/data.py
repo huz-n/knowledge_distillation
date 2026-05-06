@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import shutil
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -10,6 +9,8 @@ from typing import Optional
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
 from torchvision import datasets, transforms
+from torchvision.datasets.folder import default_loader
+from tqdm.auto import tqdm
 
 
 TINY_IMAGENET_URL = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
@@ -121,42 +122,54 @@ def _download_tiny_imagenet_if_needed(data_dir: Path) -> Path:
         print(f"Downloading Tiny ImageNet from {TINY_IMAGENET_URL} ...")
         urllib.request.urlretrieve(TINY_IMAGENET_URL, zip_path)
 
-    print("Extracting Tiny ImageNet ...")
+    print("Extracting Tiny ImageNet archive (first run can take a while on Drive) ...")
     with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(data_dir)
+        members = zf.infolist()
+        for member in tqdm(members, desc="Extracting Tiny ImageNet", unit="file"):
+            target = data_dir / member.filename
+            # Resume-friendly: skip already extracted paths.
+            if target.exists():
+                continue
+            zf.extract(member, path=data_dir)
+    print("Extraction finished.")
     return tiny_root
 
 
-def _prepare_tiny_imagenet_val_folder(tiny_root: Path) -> Path:
-    # Creates a class-subfolder structure from val annotations if needed.
-    source_val = tiny_root / "val"
-    source_images = source_val / "images"
-    ann_file = source_val / "val_annotations.txt"
-    organized_val = tiny_root / "val_by_class"
+class TinyImageNetValDataset(Dataset):
+    def __init__(
+        self,
+        tiny_root: Path,
+        class_to_idx: dict[str, int],
+        transform: Optional[transforms.Compose] = None,
+    ) -> None:
+        self.transform = transform
+        self.samples: list[tuple[Path, int]] = []
+        val_dir = tiny_root / "val"
+        images_dir = val_dir / "images"
+        ann_file = val_dir / "val_annotations.txt"
+        if not ann_file.exists():
+            raise FileNotFoundError(f"Missing Tiny ImageNet val annotations: {ann_file}")
+        with ann_file.open("r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split("\t")
+                if len(parts) < 2:
+                    continue
+                img_name, wnid = parts[0], parts[1]
+                if wnid not in class_to_idx:
+                    continue
+                img_path = images_dir / img_name
+                if img_path.exists():
+                    self.samples.append((img_path, class_to_idx[wnid]))
 
-    if organized_val.exists():
-        return organized_val
-    organized_val.mkdir(parents=True, exist_ok=True)
+    def __len__(self) -> int:
+        return len(self.samples)
 
-    if not ann_file.exists():
-        raise FileNotFoundError(f"Missing Tiny ImageNet annotations: {ann_file}")
-
-    mapping: dict[str, str] = {}
-    with ann_file.open("r", encoding="utf-8") as f:
-        for line in f:
-            parts = line.strip().split("\t")
-            if len(parts) >= 2:
-                mapping[parts[0]] = parts[1]
-
-    for img_name, class_id in mapping.items():
-        class_dir = organized_val / class_id
-        class_dir.mkdir(parents=True, exist_ok=True)
-        src = source_images / img_name
-        dst = class_dir / img_name
-        if src.exists() and not dst.exists():
-            shutil.copy2(src, dst)
-
-    return organized_val
+    def __getitem__(self, index: int):
+        img_path, label = self.samples[index]
+        img = default_loader(str(img_path))
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label
 
 
 def _build_cifar_loaders(
@@ -234,12 +247,15 @@ def _build_tiny_imagenet_loaders(
     max_test_items: Optional[int],
 ) -> DatasetLoaders:
     tiny_root = _download_tiny_imagenet_if_needed(data_dir)
-    val_dir = _prepare_tiny_imagenet_val_folder(tiny_root)
-
     train_dir = tiny_root / "train"
     full_train = datasets.ImageFolder(root=str(train_dir), transform=train_tf)
     full_train_eval = datasets.ImageFolder(root=str(train_dir), transform=eval_tf)
-    test_ds = datasets.ImageFolder(root=str(val_dir), transform=eval_tf)
+    # Avoid expensive file-by-file copy to class folders on Drive.
+    test_ds = TinyImageNetValDataset(
+        tiny_root=tiny_root,
+        class_to_idx=full_train.class_to_idx,
+        transform=eval_tf,
+    )
     num_classes = len(full_train.classes)
 
     if val_size <= 0 or val_size >= len(full_train):
