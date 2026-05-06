@@ -268,6 +268,8 @@ def main() -> None:
     student = build_model_with_embedding(
         model_name=args.student, num_classes=10, pretrained=False
     ).to(device)
+    student_total_params = sum(p.numel() for p in student.parameters())
+    student_trainable_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
 
     projector: nn.Module
     if student.embedding_dim == teacher.embedding_dim:
@@ -275,6 +277,7 @@ def main() -> None:
     else:
         projector = nn.Linear(student.embedding_dim, teacher.embedding_dim)
     projector = projector.to(device)
+    projector_total_params = sum(p.numel() for p in projector.parameters())
 
     loaders = build_cifar10_loaders(
         data_dir=args.data_dir,
@@ -392,8 +395,13 @@ def main() -> None:
     metrics_blob = {
         "args": vars(args),
         "device": str(device),
+        "teacher_model": args.teacher,
+        "teacher_checkpoint_used": bool(args.teacher_checkpoint),
         "student_embedding_dim": student.embedding_dim,
         "teacher_embedding_dim": teacher.embedding_dim,
+        "student_total_params": student_total_params,
+        "student_trainable_params": student_trainable_params,
+        "projector_total_params": projector_total_params,
         "history": [asdict(h) for h in history],
         "best_val_acc": best_val_acc,
         **test_metrics,

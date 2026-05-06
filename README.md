@@ -4,7 +4,7 @@ This repository starts with a small, reliable baseline and now includes the firs
 
 Current scope:
 - Dataset: CIFAR-10
-- Teacher: pretrained/frozen ResNet-50 (embedding source)
+- Teacher: ResNet-50 trained on CIFAR-10, then frozen for distillation
 - Student: ResNet-18 or MobileNetV3-small
 - Training:
   - baseline supervised (cross-entropy)
@@ -14,7 +14,7 @@ Current scope:
 ## Quick Start (Google Colab)
 
 1. Open `notebooks/colab_baseline_runner.ipynb` in Colab for a smoke test.
-2. Open `notebooks/colab_distill_runner.ipynb` for core baseline-vs-distill runs.
+2. Open `notebooks/colab_distill_runner.ipynb` for full core runs (teacher + 2 students + plots).
 2. Run all cells in order.
 3. First run a short sanity pass (`--max-train-batches` / `--max-val-batches`), then scale epochs/batch size.
 
@@ -30,7 +30,27 @@ python -m src.train_distill --teacher-pretrained --epochs 1 --max-train-batches 
 
 Artifacts are stored in `outputs/`.
 
+## Why Teacher Checkpoint Flow Matters
+
+Distillation quality depends on the teacher embedding space. If the teacher is not adapted to CIFAR-10,
+students may match features that are less aligned with your target dataset.
+
+Recommended flow:
+1. Train teacher on CIFAR-10 and save checkpoint.
+2. Freeze teacher.
+3. Train students to match teacher embeddings (plus optional classification loss).
+
+This repository supports that flow directly.
+
 ## Core Commands
+
+Train teacher:
+```bash
+python -m src.train_teacher \
+  --teacher-model resnet50 \
+  --teacher-pretrained \
+  --output-dir ./outputs/teacher_resnet50
+```
 
 Baseline:
 ```bash
@@ -42,7 +62,7 @@ Distillation:
 python -m src.train_distill \
   --student resnet18 \
   --teacher resnet50 \
-  --teacher-pretrained \
+  --teacher-checkpoint ./outputs/teacher_resnet50/teacher_best.pt \
   --distill-loss mse \
   --alpha 1.0 \
   --beta 1.0 \
@@ -56,4 +76,23 @@ python -m src.compare_runs \
   --distill-metrics ./outputs/distill_core/metrics.json \
   --label resnet18 \
   --output-dir ./outputs/compare_core
+```
+
+Compare multiple students:
+```bash
+python -m src.compare_students \
+  --run resnet18:./outputs/baseline_resnet18/metrics.json:./outputs/distill_resnet18/metrics.json \
+  --run mobilenetv3_small:./outputs/baseline_mobilenetv3/metrics.json:./outputs/distill_mobilenetv3/metrics.json \
+  --output-dir ./outputs/compare_students
+```
+
+Embedding visualization:
+```bash
+python -m src.visualize_embeddings \
+  --student-model resnet18 \
+  --teacher-model resnet50 \
+  --teacher-checkpoint ./outputs/teacher_resnet50/teacher_best.pt \
+  --baseline-checkpoint ./outputs/baseline_resnet18/student_best.pt \
+  --distill-checkpoint ./outputs/distill_resnet18/student_best.pt \
+  --output-dir ./outputs/embedding_viz_resnet18
 ```
