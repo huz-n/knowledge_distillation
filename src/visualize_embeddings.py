@@ -58,16 +58,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--align-mode",
         type=str,
-        default="lstsq_procrustes",
+        default="lstsq",
         choices=["none", "lstsq", "lstsq_procrustes"],
         help="How to align student embeddings to teacher space for joint visualization.",
     )
     parser.add_argument(
         "--normalize-mode",
         type=str,
-        default="l2_zscore",
-        choices=["none", "l2", "zscore", "l2_zscore"],
-        help="Per-model normalization before PCA/t-SNE.",
+        default="l2_teacher_zscore",
+        choices=["none", "l2", "zscore", "l2_zscore", "teacher_zscore", "l2_teacher_zscore"],
+        help=(
+            "Normalization policy before PCA/t-SNE. "
+            "teacher_* modes use teacher statistics as the shared reference to avoid per-model variance mismatch."
+        ),
     )
     return parser.parse_args()
 
@@ -179,11 +182,44 @@ def _zscore_features(x: np.ndarray) -> np.ndarray:
 
 def normalize_embeddings(x: np.ndarray, mode: str) -> np.ndarray:
     out = x.astype(np.float64, copy=True)
-    if mode in {"l2", "l2_zscore"}:
+    if mode in {"l2", "l2_zscore", "l2_teacher_zscore"}:
         out = _l2_normalize_rows(out)
     if mode in {"zscore", "l2_zscore"}:
         out = _zscore_features(out)
     return out.astype(np.float32)
+
+
+def _zscore_with_reference(x: np.ndarray, mu: np.ndarray, sigma: np.ndarray) -> np.ndarray:
+    sigma = np.maximum(sigma, 1e-6)
+    return (x - mu) / sigma
+
+
+def normalize_triplet(
+    teacher: np.ndarray,
+    baseline: np.ndarray,
+    distill: np.ndarray,
+    mode: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if mode in {"teacher_zscore", "l2_teacher_zscore"}:
+        teacher_n = normalize_embeddings(teacher, mode="l2" if mode == "l2_teacher_zscore" else "none")
+        baseline_n = normalize_embeddings(baseline, mode="l2" if mode == "l2_teacher_zscore" else "none")
+        distill_n = normalize_embeddings(distill, mode="l2" if mode == "l2_teacher_zscore" else "none")
+        mu = teacher_n.mean(axis=0, keepdims=True)
+        sigma = teacher_n.std(axis=0, keepdims=True)
+        teacher_n = _zscore_with_reference(teacher_n, mu=mu, sigma=sigma)
+        baseline_n = _zscore_with_reference(baseline_n, mu=mu, sigma=sigma)
+        distill_n = _zscore_with_reference(distill_n, mu=mu, sigma=sigma)
+        return (
+            teacher_n.astype(np.float32),
+            baseline_n.astype(np.float32),
+            distill_n.astype(np.float32),
+        )
+
+    return (
+        normalize_embeddings(teacher, mode=mode),
+        normalize_embeddings(baseline, mode=mode),
+        normalize_embeddings(distill, mode=mode),
+    )
 
 
 def _orthogonal_procrustes_map(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -359,9 +395,12 @@ def main() -> None:
     if args.align_mode == "lstsq_procrustes":
         teacher_aligned = teacher_raw - teacher_raw.mean(axis=0, keepdims=True)
 
-    teacher_arr = normalize_embeddings(teacher_aligned, mode=args.normalize_mode)
-    baseline_arr = normalize_embeddings(baseline_aligned, mode=args.normalize_mode)
-    distill_arr = normalize_embeddings(distill_aligned, mode=args.normalize_mode)
+    teacher_arr, baseline_arr, distill_arr = normalize_triplet(
+        teacher=teacher_aligned,
+        baseline=baseline_aligned,
+        distill=distill_aligned,
+        mode=args.normalize_mode,
+    )
 
     # Joint space plots (all models together).
     stacked = np.concatenate([teacher_arr, baseline_arr, distill_arr], axis=0)
