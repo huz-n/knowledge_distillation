@@ -17,7 +17,10 @@ def parse_args() -> argparse.Namespace:
         "--run",
         action="append",
         required=True,
-        help="Format: model_label:baseline_metrics_path:distill_metrics_path",
+        help=(
+            "Format: model_label|baseline_metrics_path|distill_metrics_path "
+            "(preferred, Windows-safe) or legacy model_label:baseline:distill"
+        ),
     )
     parser.add_argument("--output-dir", type=str, default="./outputs/compare_students")
     return parser.parse_args()
@@ -29,10 +32,19 @@ def load_json(path: str) -> dict:
 
 
 def parse_run_spec(spec: str) -> tuple[str, str, str]:
+    if "|" in spec:
+        parts = spec.split("|")
+        if len(parts) != 3:
+            raise ValueError(f"Invalid --run spec: {spec}")
+        return parts[0], parts[1], parts[2]
+
     parts = spec.split(":")
-    if len(parts) != 3:
-        raise ValueError(f"Invalid --run spec: {spec}")
-    return parts[0], parts[1], parts[2]
+    if len(parts) == 3:
+        return parts[0], parts[1], parts[2]
+    raise ValueError(
+        "Invalid --run spec. Use model_label|baseline_metrics_path|distill_metrics_path "
+        "for Windows-safe paths."
+    )
 
 
 def main() -> None:

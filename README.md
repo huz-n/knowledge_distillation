@@ -15,6 +15,7 @@ Current scope:
 - Training:
   - baseline supervised (cross-entropy)
   - embedding distillation (`mse` or `cosine`)
+  - optional PCA-compressed teacher target space via `--distill-dim`
   - logit distillation (KL with temperature)
   - configurable weighted objective (`classification + embedding + logit`)
 - Metrics:
@@ -103,9 +104,12 @@ python -m src.train_distill \
   --teacher resnet50 \
   --teacher-checkpoint ./outputs/teacher_resnet50/teacher_best.pt \
   --augment strong \
-  --embed-loss mse \
+  --distill-dim 256 \
+  --teacher-pca-samples 10000 \
+  --embed-loss cosine \
+  --embed-normalize \
   --cls-weight 1.0 \
-  --embed-weight 1.0 \
+  --embed-weight 0.2 \
   --logit-weight 0.0 \
   --output-dir ./outputs/distill_core
 ```
@@ -136,19 +140,19 @@ python -m src.compare_runs \
 Compare multiple students:
 ```bash
 python -m src.compare_students \
-  --run resnet18:./outputs/baseline_resnet18/metrics.json:./outputs/distill_resnet18_embed_cls/metrics.json \
-  --run mobilenetv3_small:./outputs/baseline_mobilenetv3/metrics.json:./outputs/distill_mobilenetv3_embed_cls/metrics.json \
+  --run "resnet18|./outputs/baseline_resnet18/metrics.json|./outputs/distill_resnet18_embed_cls/metrics.json" \
+  --run "mobilenetv3_small|./outputs/baseline_mobilenetv3/metrics.json|./outputs/distill_mobilenetv3_embed_cls/metrics.json" \
   --output-dir ./outputs/compare_students
 ```
 
 Compare distillation variants:
 ```bash
 python -m src.compare_variants \
-  --run baseline_cls:./outputs/baseline_resnet18/metrics.json \
-  --run embed_plus_cls:./outputs/distill_resnet18_embed_cls/metrics.json \
-  --run embed_only:./outputs/distill_resnet18_embed_only/metrics.json \
-  --run logit_plus_cls:./outputs/distill_resnet18_logit_cls/metrics.json \
-  --run embed_logit_cls:./outputs/distill_resnet18_embed_logit_cls/metrics.json \
+  --run "baseline_cls|./outputs/baseline_resnet18/metrics.json" \
+  --run "embed_plus_cls|./outputs/distill_resnet18_embed_cls/metrics.json" \
+  --run "embed_only|./outputs/distill_resnet18_embed_only/metrics.json" \
+  --run "logit_plus_cls|./outputs/distill_resnet18_logit_cls/metrics.json" \
+  --run "embed_logit_cls|./outputs/distill_resnet18_embed_logit_cls/metrics.json" \
   --title "ResNet-18 Distillation Ablations" \
   --output-dir ./outputs/compare_variants_resnet18
 ```

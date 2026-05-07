@@ -77,6 +77,24 @@ Transform presets:
 - `basic`: crop + horizontal flip + normalize.
 - `strong`: crop + flip + RandAugment + RandomErasing + normalize.
 
+Exact transform definitions from `src/data.py`:
+- CIFAR mean/std: `(0.4914, 0.4822, 0.4465)` / `(0.2023, 0.1994, 0.2010)`
+- Tiny ImageNet mean/std: ImageNet normalization `(0.485, 0.456, 0.406)` / `(0.229, 0.224, 0.225)`
+- `basic`:
+  - optional resize to `image_size`
+  - `RandomCrop(image_size, padding=max(4, image_size // 8))`
+  - `RandomHorizontalFlip()`
+  - `ToTensor()`
+  - `Normalize(mean, std)`
+- `strong`:
+  - optional resize to `image_size`
+  - `RandomCrop(image_size, padding=max(4, image_size // 8))`
+  - `RandomHorizontalFlip()`
+  - `RandAugment(num_ops=2, magnitude=9)`
+  - `ToTensor()`
+  - `Normalize(mean, std)`
+  - `RandomErasing(p=0.25, scale=(0.02, 0.2), ratio=(0.3, 3.0))`
+
 Normalization:
 - CIFAR statistics for CIFAR datasets.
 - ImageNet-style statistics for Tiny ImageNet.
@@ -157,6 +175,11 @@ Options:
 Optional normalization:
 - `--embed-normalize` applies L2 normalization to both projected student embedding and teacher embedding before embedding loss.
 
+Optional lower-dimensional teacher target:
+- `--distill-dim N` compresses teacher embeddings into an `N`-dimensional bottleneck before matching.
+- The bottleneck is fit once per run with PCA on teacher embeddings collected from the training split.
+- This is especially useful when the raw teacher space is much larger than the student space (for example, `2048 -> 128`).
+
 ### 5.3 Logit Distillation Loss
 
 - KL divergence between temperature-scaled student and teacher logits:
@@ -194,6 +217,14 @@ Key options:
 - `--image-size`
 - `--epochs`, `--batch-size`
 
+Implementation defaults:
+- optimizer: `AdamW`
+- learning rate: `3e-4`
+- weight decay: `1e-4`
+- scheduler: `CosineAnnealingLR(T_max=epochs)`
+- CLI defaults: `batch_size=64`, `epochs=5`, `image_size=160`, `augment=basic`, `val_size=5000`
+- optional runtime optimization: CUDA autocast, TF32, cuDNN benchmark, `channels_last`
+
 Outputs:
 - `teacher_best.pt`
 - `metrics.json`
@@ -209,6 +240,13 @@ Key options:
 - `--student {resnet18|mobilenetv3_small|tiny_cnn}`
 - `--augment`
 - `--image-size`
+
+Implementation defaults:
+- optimizer: `AdamW`
+- learning rate: `3e-4`
+- weight decay: `1e-4`
+- scheduler: `CosineAnnealingLR(T_max=epochs)`
+- CLI defaults: `batch_size=64`, `epochs=3`, `image_size=160`, `augment=basic`, `val_size=5000`
 
 Outputs:
 - `student_best.pt`
@@ -229,6 +267,40 @@ Key options:
 - `--embed-normalize`
 - `--cls-weight --embed-weight --logit-weight`
 - `--temperature`
+
+Implementation defaults:
+- optimizer: `AdamW` over `student + projector`
+- learning rate: `3e-4`
+- weight decay: `1e-4`
+- scheduler: `CosineAnnealingLR(T_max=epochs)`
+- CLI defaults: `batch_size=64`, `epochs=3`, `image_size=160`, `augment=basic`, `val_size=5000`
+- default loss mix: `cls_weight=1.0`, `embed_weight=1.0`, `logit_weight=0.0`, `temperature=2.0`
+- default embedding loss: `mse`
+- teacher is used during validation/test inside the distillation script only to log distillation-related losses; deployment/inference still uses student only
+
+### 6.4 Notebook Presets vs CLI Defaults
+
+The Colab notebooks intentionally override the lightweight CLI defaults:
+
+- `notebooks/colab_distill_runner.ipynb`:
+  - dataset: `cifar10`
+  - image size: `64`
+  - batch size: `96`
+  - teacher epochs: `2`
+  - student epochs: `3`
+  - teacher mode: `head_only`
+  - augment: `basic`
+- `notebooks/colab_tiny_imagenet_runner.ipynb`:
+  - dataset: `tiny_imagenet`
+  - image size: `64`
+  - batch size: `128`
+  - validation split from train: `10000`
+  - teacher epochs: `6`
+  - student epochs: `8`
+  - teacher mode: `full`
+  - augment: `basic`
+
+This distinction matters for the presentation: the codebase defaults are for a generic, quick-start CLI experience, while the notebooks define the actual experiment presets used in Colab.
 
 Outputs:
 - `student_best.pt` (includes student + projector states)

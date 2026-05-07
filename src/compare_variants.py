@@ -15,7 +15,7 @@ def parse_args() -> argparse.Namespace:
         "--run",
         action="append",
         required=True,
-        help="Format: label:metrics_path",
+        help="Format: label|metrics_path (preferred, Windows-safe) or legacy label:metrics_path",
     )
     parser.add_argument("--output-dir", type=str, default="./outputs/compare_variants")
     parser.add_argument("--title", type=str, default="Experiment Variant Comparison")
@@ -28,10 +28,16 @@ def load_json(path: str) -> dict:
 
 
 def parse_run_spec(spec: str) -> tuple[str, str]:
+    if "|" in spec:
+        parts = spec.split("|")
+        if len(parts) != 2:
+            raise ValueError(f"Invalid --run spec: {spec}")
+        return parts[0], parts[1]
+
     parts = spec.split(":")
-    if len(parts) != 2:
-        raise ValueError(f"Invalid --run spec: {spec}")
-    return parts[0], parts[1]
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    raise ValueError("Invalid --run spec. Use label|metrics_path for Windows-safe paths.")
 
 
 def main() -> None:

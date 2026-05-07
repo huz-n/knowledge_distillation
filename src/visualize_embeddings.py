@@ -8,11 +8,26 @@ from typing import Dict, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
 from src.data import build_image_classification_loaders
 from src.models import build_model_with_embedding
+
+
+class PCATeacherTransform(nn.Module):
+    def __init__(self, mean: torch.Tensor, components: torch.Tensor) -> None:
+        super().__init__()
+        self.register_buffer("mean", mean)
+        self.register_buffer("components", components)
+
+    @property
+    def output_dim(self) -> int:
+        return int(self.components.shape[1])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) @ self.components
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,23 +98,42 @@ def load_baseline_student(
     return model
 
 
+def load_teacher_transform(device: torch.device, checkpoint_state: dict, teacher_emb_dim: int) -> torch.nn.Module:
+    tf_state = checkpoint_state.get("teacher_transform", None)
+    tf_type = checkpoint_state.get("teacher_transform_type", "Identity")
+    if not tf_state:
+        return torch.nn.Identity().to(device)
+    if tf_type == "PCATeacherTransform":
+        mean = tf_state["mean"]
+        components = tf_state["components"]
+        transform = PCATeacherTransform(mean=mean, components=components)
+        return transform.to(device)
+    if teacher_emb_dim == 0:
+        raise ValueError("Unsupported teacher transform checkpoint without known teacher embedding dim.")
+    return torch.nn.Identity().to(device)
+
+
 def load_distill_student(
-    device: torch.device, args: argparse.Namespace, teacher_emb_dim: int, num_classes: int
+    device: torch.device,
+    args: argparse.Namespace,
+    checkpoint_state: dict,
+    teacher_target_dim: int,
+    num_classes: int,
 ) -> Tuple[torch.nn.Module, torch.nn.Module]:
     model = build_model_with_embedding(model_name=args.student_model, num_classes=num_classes, pretrained=False).to(
         device
     )
-    state = torch.load(args.distill_checkpoint, map_location=device)
+    state = checkpoint_state
     student_state = state["student"] if "student" in state else state.get("model", state)
     model.load_state_dict(student_state, strict=True)
 
     projector: torch.nn.Module
     proj_state = state.get("projector", None)
     if proj_state is None:
-        if model.embedding_dim == teacher_emb_dim:
+        if model.embedding_dim == teacher_target_dim:
             projector = torch.nn.Identity()
         else:
-            projector = torch.nn.Linear(model.embedding_dim, teacher_emb_dim)
+            projector = torch.nn.Linear(model.embedding_dim, teacher_target_dim)
     else:
         keys = set(proj_state.keys())
         if len(keys) == 0:
@@ -187,6 +221,7 @@ def align_to_teacher_space(teacher: np.ndarray, student: np.ndarray, mode: str) 
 @torch.no_grad()
 def collect_embeddings(
     teacher: torch.nn.Module,
+    teacher_transform: torch.nn.Module,
     baseline_student: torch.nn.Module,
     distill_student: torch.nn.Module,
     distill_projector: torch.nn.Module,
@@ -207,6 +242,7 @@ def collect_embeddings(
         y = y.to(device, non_blocking=True)
 
         _, t_emb = teacher(x, return_embedding=True)
+        t_emb = teacher_transform(t_emb)
         _, b_emb = baseline_student(x, return_embedding=True)
         _, d_emb = distill_student(x, return_embedding=True)
         d_emb = distill_projector(d_emb)
@@ -279,12 +315,26 @@ def main() -> None:
     num_classes = loaders.num_classes
 
     teacher = load_teacher(device=device, args=args, num_classes=num_classes)
+    distill_state = torch.load(args.distill_checkpoint, map_location=device)
+    teacher_transform = load_teacher_transform(
+        device=device,
+        checkpoint_state=distill_state,
+        teacher_emb_dim=teacher.embedding_dim,
+    )
+    teacher_target_dim = (
+        teacher_transform.output_dim if hasattr(teacher_transform, "output_dim") else teacher.embedding_dim
+    )
     baseline_student = load_baseline_student(device=device, args=args, num_classes=num_classes)
     distill_student, distill_projector = load_distill_student(
-        device=device, args=args, teacher_emb_dim=teacher.embedding_dim, num_classes=num_classes
+        device=device,
+        args=args,
+        checkpoint_state=distill_state,
+        teacher_target_dim=teacher_target_dim,
+        num_classes=num_classes,
     )
     bundle = collect_embeddings(
         teacher=teacher,
+        teacher_transform=teacher_transform,
         baseline_student=baseline_student,
         distill_student=distill_student,
         distill_projector=distill_projector,
@@ -384,6 +434,7 @@ def main() -> None:
         "teacher_raw_dim": int(teacher_raw.shape[1]),
         "baseline_raw_dim": int(baseline_raw.shape[1]),
         "distill_raw_dim": int(distill_raw.shape[1]),
+        "teacher_transform_type": distill_state.get("teacher_transform_type", "Identity"),
         "align_mode": args.align_mode,
         "normalize_mode": args.normalize_mode,
         "artifacts": [

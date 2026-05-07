@@ -39,6 +39,20 @@ class EpochMetrics:
     seconds: float
 
 
+class PCATeacherTransform(nn.Module):
+    def __init__(self, mean: torch.Tensor, components: torch.Tensor) -> None:
+        super().__init__()
+        self.register_buffer("mean", mean)
+        self.register_buffer("components", components)
+
+    @property
+    def output_dim(self) -> int:
+        return int(self.components.shape[1])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) @ self.components
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Student training with embedding/logit distillation."
@@ -73,6 +87,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-val-batches", type=int, default=0)
     parser.add_argument("--channels-last", action="store_true")
     parser.add_argument("--embed-loss", type=str, default="mse", choices=["mse", "cosine"])
+    parser.add_argument(
+        "--distill-dim",
+        type=int,
+        default=0,
+        help="Target dimensionality for embedding distillation. 0 keeps raw teacher embedding size.",
+    )
+    parser.add_argument(
+        "--teacher-pca-samples",
+        type=int,
+        default=10000,
+        help="Max number of train samples used to fit the teacher PCA bottleneck when --distill-dim > 0.",
+    )
     parser.add_argument(
         "--embed-normalize",
         action="store_true",
@@ -124,10 +150,76 @@ def zero_like_loss(reference: torch.Tensor) -> torch.Tensor:
     return torch.zeros((), device=reference.device, dtype=reference.dtype)
 
 
+@torch.no_grad()
+def collect_teacher_embeddings(
+    teacher: nn.Module,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    channels_last: bool,
+) -> torch.Tensor:
+    teacher.eval()
+    autocast_enabled = device.type == "cuda"
+    chunks: List[torch.Tensor] = []
+    for x, _ in tqdm(loader, leave=False, desc="teacher_pca"):
+        x = x.to(device, non_blocking=True)
+        if channels_last and x.ndim == 4:
+            x = x.contiguous(memory_format=torch.channels_last)
+        with torch.autocast(device_type=device.type, enabled=autocast_enabled):
+            _, teacher_emb = teacher(x, return_embedding=True)
+        chunks.append(teacher_emb.detach().float().cpu())
+    if not chunks:
+        raise ValueError("No teacher embeddings collected for PCA bottleneck.")
+    return torch.cat(chunks, dim=0)
+
+
+def build_teacher_target_transform(
+    teacher: nn.Module,
+    device: torch.device,
+    args: argparse.Namespace,
+) -> nn.Module:
+    if args.distill_dim <= 0 or args.distill_dim >= teacher.embedding_dim:
+        return nn.Identity()
+
+    pca_loaders = build_image_classification_loaders(
+        dataset_name=args.dataset,
+        data_dir=args.data_dir,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        image_size=args.image_size,
+        augment="none",
+        prefetch_factor=args.prefetch_factor,
+        persistent_workers=not args.no_persistent_workers,
+        val_size=args.val_size,
+        seed=args.seed,
+        max_train_items=args.teacher_pca_samples if args.teacher_pca_samples > 0 else None,
+        max_val_items=1,
+        max_test_items=1,
+    )
+    teacher_embs = collect_teacher_embeddings(
+        teacher=teacher,
+        loader=pca_loaders.train,
+        device=device,
+        channels_last=args.channels_last,
+    )
+    n, d = teacher_embs.shape
+    q = min(args.distill_dim, d, n)
+    if q <= 0:
+        return nn.Identity()
+    mean = teacher_embs.mean(dim=0, keepdim=True)
+    centered = teacher_embs - mean
+    print(
+        f"Fitting teacher PCA bottleneck: samples={n}, input_dim={d}, output_dim={q}"
+    )
+    _, _, v = torch.pca_lowrank(centered, q=q, center=False)
+    components = v[:, :q].contiguous()
+    return PCATeacherTransform(mean=mean, components=components).to(device)
+
+
 def run_epoch(
     student: nn.Module,
     teacher: nn.Module,
     projector: nn.Module,
+    teacher_transform: nn.Module,
     loader: torch.utils.data.DataLoader,
     device: torch.device,
     cls_criterion: nn.Module,
@@ -148,6 +240,7 @@ def run_epoch(
     student.train(training)
     projector.train(training)
     teacher.eval()
+    teacher_transform.eval()
 
     total_items = 0
     total_loss = 0.0
@@ -174,6 +267,7 @@ def run_epoch(
         with torch.no_grad():
             with torch.autocast(device_type=device.type, enabled=autocast_enabled):
                 teacher_logits, teacher_emb = teacher(x, return_embedding=True)
+                teacher_emb = teacher_transform(teacher_emb)
 
         with torch.autocast(device_type=device.type, enabled=autocast_enabled):
             student_logits, student_emb = student(x, return_embedding=True)
@@ -228,6 +322,7 @@ def evaluate_test(
     student: nn.Module,
     teacher: nn.Module,
     projector: nn.Module,
+    teacher_transform: nn.Module,
     loader: torch.utils.data.DataLoader,
     device: torch.device,
     cls_criterion: nn.Module,
@@ -246,6 +341,7 @@ def evaluate_test(
         student=student,
         teacher=teacher,
         projector=projector,
+        teacher_transform=teacher_transform,
         loader=loader,
         device=device,
         cls_criterion=cls_criterion,
@@ -363,6 +459,7 @@ def main() -> None:
     for param in teacher.parameters():
         param.requires_grad = False
     teacher.eval()
+    teacher_transform = build_teacher_target_transform(teacher=teacher, device=device, args=args)
 
     student = build_model_with_embedding(
         model_name=args.student, num_classes=num_classes, pretrained=False
@@ -372,14 +469,19 @@ def main() -> None:
     student_total_params = sum(p.numel() for p in student.parameters())
     student_trainable_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
 
-    if student.embedding_dim == teacher.embedding_dim:
+    if hasattr(teacher_transform, "output_dim"):
+        teacher_target_dim = int(teacher_transform.output_dim)
+    else:
+        teacher_target_dim = teacher.embedding_dim
+
+    if student.embedding_dim == teacher_target_dim:
         projector: nn.Module = nn.Identity()
     else:
-        hidden_dim = max(student.embedding_dim * 2, teacher.embedding_dim)
+        hidden_dim = max(student.embedding_dim * 2, teacher_target_dim)
         projector = nn.Sequential(
             nn.Linear(student.embedding_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, teacher.embedding_dim),
+            nn.Linear(hidden_dim, teacher_target_dim),
         )
     projector = projector.to(device)
     projector_total_params = sum(p.numel() for p in projector.parameters())
@@ -404,6 +506,7 @@ def main() -> None:
             student=student,
             teacher=teacher,
             projector=projector,
+            teacher_transform=teacher_transform,
             loader=loaders.train,
             device=device,
             cls_criterion=cls_criterion,
@@ -424,6 +527,7 @@ def main() -> None:
             student=student,
             teacher=teacher,
             projector=projector,
+            teacher_transform=teacher_transform,
             loader=loaders.val,
             device=device,
             cls_criterion=cls_criterion,
@@ -476,6 +580,8 @@ def main() -> None:
                     "epoch": epoch,
                     "student": student.state_dict(),
                     "projector": projector.state_dict(),
+                    "teacher_transform": teacher_transform.state_dict(),
+                    "teacher_transform_type": teacher_transform.__class__.__name__,
                     "optimizer": optimizer.state_dict(),
                     "val_acc": val_acc,
                     "args": vars(args),
@@ -487,6 +593,7 @@ def main() -> None:
         student=student,
         teacher=teacher,
         projector=projector,
+        teacher_transform=teacher_transform,
         loader=loaders.test,
         device=device,
         cls_criterion=cls_criterion,
@@ -511,8 +618,11 @@ def main() -> None:
         "teacher_checkpoint_used": bool(args.teacher_checkpoint),
         "augment": args.augment,
         "embed_normalize": args.embed_normalize,
+        "distill_dim": args.distill_dim,
         "student_embedding_dim": student.embedding_dim,
         "teacher_embedding_dim": teacher.embedding_dim,
+        "teacher_target_dim": teacher_target_dim,
+        "teacher_transform_type": teacher_transform.__class__.__name__,
         "student_total_params": student_total_params,
         "student_trainable_params": student_trainable_params,
         "projector_total_params": projector_total_params,
