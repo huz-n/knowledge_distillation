@@ -108,6 +108,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embed-weight", type=float, default=1.0)
     parser.add_argument("--logit-weight", type=float, default=0.0)
     parser.add_argument("--temperature", type=float, default=2.0)
+    parser.add_argument(
+        "--projector-depth",
+        type=int,
+        default=2,
+        help="Number of linear layers in the student->teacher projector (>=1).",
+    )
+    parser.add_argument(
+        "--projector-hidden-dim",
+        type=int,
+        default=0,
+        help="Hidden width for multilayer projector. 0 keeps previous auto-width behavior.",
+    )
+    parser.add_argument(
+        "--projector-dropout",
+        type=float,
+        default=0.0,
+        help="Dropout used between hidden projector layers.",
+    )
     return parser.parse_args()
 
 
@@ -148,6 +166,42 @@ def logit_kd_loss(student_logits: torch.Tensor, teacher_logits: torch.Tensor, te
 
 def zero_like_loss(reference: torch.Tensor) -> torch.Tensor:
     return torch.zeros((), device=reference.device, dtype=reference.dtype)
+
+
+def build_projector(
+    student_dim: int,
+    teacher_target_dim: int,
+    depth: int,
+    hidden_dim: int,
+    dropout: float,
+) -> nn.Module:
+    if depth < 1:
+        raise ValueError("--projector-depth must be >= 1.")
+    if dropout < 0.0 or dropout >= 1.0:
+        raise ValueError("--projector-dropout must be in [0.0, 1.0).")
+
+    if student_dim == teacher_target_dim and depth == 1:
+        return nn.Identity()
+
+    if depth == 1:
+        return nn.Linear(student_dim, teacher_target_dim)
+
+    if hidden_dim > 0:
+        h = hidden_dim
+    else:
+        # Backward-compatible default: the old projector used one large hidden layer.
+        h = max(student_dim * 2, teacher_target_dim)
+
+    layers: List[nn.Module] = []
+    in_dim = student_dim
+    for _ in range(depth - 1):
+        layers.append(nn.Linear(in_dim, h))
+        layers.append(nn.ReLU())
+        if dropout > 0.0:
+            layers.append(nn.Dropout(p=dropout))
+        in_dim = h
+    layers.append(nn.Linear(in_dim, teacher_target_dim))
+    return nn.Sequential(*layers)
 
 
 @torch.no_grad()
@@ -474,15 +528,13 @@ def main() -> None:
     else:
         teacher_target_dim = teacher.embedding_dim
 
-    if student.embedding_dim == teacher_target_dim:
-        projector: nn.Module = nn.Identity()
-    else:
-        hidden_dim = max(student.embedding_dim * 2, teacher_target_dim)
-        projector = nn.Sequential(
-            nn.Linear(student.embedding_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, teacher_target_dim),
-        )
+    projector = build_projector(
+        student_dim=student.embedding_dim,
+        teacher_target_dim=teacher_target_dim,
+        depth=args.projector_depth,
+        hidden_dim=args.projector_hidden_dim,
+        dropout=args.projector_dropout,
+    )
     projector = projector.to(device)
     projector_total_params = sum(p.numel() for p in projector.parameters())
 
@@ -580,6 +632,13 @@ def main() -> None:
                     "epoch": epoch,
                     "student": student.state_dict(),
                     "projector": projector.state_dict(),
+                    "projector_spec": {
+                        "student_dim": student.embedding_dim,
+                        "teacher_target_dim": teacher_target_dim,
+                        "depth": args.projector_depth,
+                        "hidden_dim": args.projector_hidden_dim,
+                        "dropout": args.projector_dropout,
+                    },
                     "teacher_transform": teacher_transform.state_dict(),
                     "teacher_transform_type": teacher_transform.__class__.__name__,
                     "optimizer": optimizer.state_dict(),
@@ -626,6 +685,9 @@ def main() -> None:
         "student_total_params": student_total_params,
         "student_trainable_params": student_trainable_params,
         "projector_total_params": projector_total_params,
+        "projector_depth": args.projector_depth,
+        "projector_hidden_dim": args.projector_hidden_dim,
+        "projector_dropout": args.projector_dropout,
         "history": [asdict(h) for h in history],
         "best_val_acc": best_val_acc,
         **test_metrics,

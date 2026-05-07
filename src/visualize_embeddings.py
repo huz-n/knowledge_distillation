@@ -30,6 +30,33 @@ class PCATeacherTransform(nn.Module):
         return (x - self.mean) @ self.components
 
 
+def build_projector_from_spec(spec: dict) -> torch.nn.Module:
+    student_dim = int(spec["student_dim"])
+    teacher_target_dim = int(spec["teacher_target_dim"])
+    depth = int(spec.get("depth", 2))
+    hidden_dim = int(spec.get("hidden_dim", 0))
+    dropout = float(spec.get("dropout", 0.0))
+
+    if depth <= 1:
+        if student_dim == teacher_target_dim:
+            return torch.nn.Identity()
+        return torch.nn.Linear(student_dim, teacher_target_dim)
+
+    if hidden_dim <= 0:
+        hidden_dim = max(student_dim * 2, teacher_target_dim)
+
+    layers = []
+    in_dim = student_dim
+    for _ in range(depth - 1):
+        layers.append(torch.nn.Linear(in_dim, hidden_dim))
+        layers.append(torch.nn.ReLU())
+        if dropout > 0.0:
+            layers.append(torch.nn.Dropout(p=dropout))
+        in_dim = hidden_dim
+    layers.append(torch.nn.Linear(in_dim, teacher_target_dim))
+    return torch.nn.Sequential(*layers)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Visualize teacher vs baseline vs distillation embeddings."
@@ -138,6 +165,15 @@ def load_distill_student(
         else:
             projector = torch.nn.Linear(model.embedding_dim, teacher_target_dim)
     else:
+        spec = state.get("projector_spec")
+        if isinstance(spec, dict):
+            projector = build_projector_from_spec(spec)
+            projector.load_state_dict(proj_state, strict=True)
+            projector = projector.to(device)
+            model.eval()
+            projector.eval()
+            return model, projector
+
         keys = set(proj_state.keys())
         if len(keys) == 0:
             projector = torch.nn.Identity()
