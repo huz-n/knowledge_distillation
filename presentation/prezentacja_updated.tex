@@ -1,7 +1,7 @@
 \documentclass{beamer}
 \usepackage[T1]{fontenc}
 \usepackage[utf8]{inputenc}
-\usepackage[english]{babel}
+\usepackage[polish]{babel}
 \usepackage{graphicx}
 \usepackage{booktabs}
 \usepackage{amsmath}
@@ -9,364 +9,176 @@
 
 \usetheme{Madrid}
 
-\title{Knowledge Distillation for Image Classification}
-\subtitle{Embedding Distillation with Baselines, Ablations, and Tiny ImageNet}
+\title{Knowledge Distillation dla klasyfikacji obrazów}
+\subtitle{CIFAR-100: porównanie baseline, embedding KD i logit KD}
 \author{Yaroslav Kolesnik, Pavel Yurashevich, Huz Nazar}
-\date{May 7, 2026}
+\date{7 maja 2026}
 
 \begin{document}
 
 \frame{\titlepage}
 
 \begin{frame}
-\frametitle{Agenda}
-\tableofcontents
-\end{frame}
-
-\section{Introduction}
-\begin{frame}
-\frametitle{Problem and Goal}
-\textbf{Goal:} compress image classifiers while preserving as much accuracy as possible.
-\vspace{0.25cm}
-
-\textbf{Project question:}
+\frametitle{Cel projektu}
 \begin{itemize}
-    \item Can a small student model learn better representations when guided by a larger teacher?
-    \item When does embedding distillation help more than plain supervised training?
-\end{itemize}
-\vspace{0.25cm}
-
-\textbf{Practical motivation:}
-\begin{itemize}
-    \item teacher = strong but expensive
-    \item student = cheaper to deploy
-    \item distillation = training-time transfer of teacher knowledge into student weights
-\end{itemize}
-\end{frame}
-
-\begin{frame}
-\frametitle{Knowledge Distillation as a Concept}
-\textbf{Classical distillation:}
-\begin{enumerate}
-    \item Train a large \textbf{teacher}.
-    \item Freeze the teacher.
-    \item Train a smaller \textbf{student} using true labels and additional teacher guidance.
-\end{enumerate}
-\vspace{0.25cm}
-
-\textbf{Key idea:}
-\begin{itemize}
-    \item labels only say which class is correct
-    \item teacher outputs/features also encode similarity structure, uncertainty, and representation geometry
-\end{itemize}
-\vspace{0.25cm}
-
-\textbf{Important:} at deployment time we use \textbf{only the student}. The teacher is a training aid, not a runtime dependency.
-\end{frame}
-
-\begin{frame}
-\frametitle{Why Embedding Distillation?}
-\textbf{Logit distillation:}
-\begin{itemize}
-    \item match teacher class probabilities
+    \item Celem projektu było sprawdzenie, czy mniejszy model może poprawić wyniki dzięki destylacji wiedzy z większego modelu.
+    \item Skupiliśmy się na klasyfikacji obrazów oraz porównaniu kilku wariantów uczenia studenta.
+    \item Ze względu na ograniczenia czasowe i obliczeniowe finalne eksperymenty wykonano na zbiorze \textbf{CIFAR-100}, a nie na Tiny ImageNet.
 \end{itemize}
 \vspace{0.2cm}
-
-\textbf{Embedding distillation:}
-\begin{itemize}
-    \item match internal feature vectors before the classifier
-    \item encourage student to organize images in a teacher-like latent space
-\end{itemize}
-\vspace{0.2cm}
-
-\textbf{Hypothesis:}
-\begin{itemize}
-    \item stronger feature supervision should help weaker students more than stronger students
-    \item effect should become clearer on harder datasets and with larger teacher-student capacity gap
-\end{itemize}
+\textbf{Pytanie badawcze:} czy embedding distillation rzeczywiście pomaga, czy lepszym kierunkiem jest klasyczna destylacja logitów?
 \end{frame}
 
-\section{Project Design}
 \begin{frame}
-\frametitle{Datasets and Experimental Progression}
-\textbf{Supported datasets in the codebase:}
+\frametitle{Dane i konfiguracja}
+\textbf{Zbiór danych:}
 \begin{itemize}
-    \item CIFAR-10
     \item CIFAR-100
-    \item Tiny ImageNet
+    \item 100 klas
+    \item obrazy o rozmiarze 64x64 po przeskalowaniu
 \end{itemize}
-\vspace{0.25cm}
+\vspace{0.2cm}
 
-\textbf{How they are used:}
+\textbf{Ustawienia treningu:}
 \begin{itemize}
-    \item CIFAR-10: smoke tests and initial debugging
-    \item CIFAR-100: optional harder intermediate benchmark
-    \item Tiny ImageNet: main final benchmark, chosen because the task is harder and the teacher-student gap is more meaningful
+    \item augmentacja: \texttt{basic} = \texttt{RandomCrop + HorizontalFlip}
+    \item batch size: 96
+    \item optymalizator: AdamW
+    \item learning rate: \texttt{3e-4}
+    \item teacher: 15 epok
+    \item student: 20 epok
 \end{itemize}
-\vspace{0.25cm}
+\vspace{0.2cm}
 
-\textbf{Tiny ImageNet setup used in Colab:}
-\begin{itemize}
-    \item 200 classes, 64x64 images
-    \item train split further divided into 90k train / 10k validation
-    \item official validation set used as held-out test set
-\end{itemize}
+\textbf{Metryki:} Accuracy oraz Macro-F1.
 \end{frame}
 
 \begin{frame}
-\frametitle{Data Pipeline and Augmentations}
-\textbf{Preprocessing pipeline:}
-\begin{itemize}
-    \item optional resize to target image size
-    \item convert to tensor
-    \item dataset-specific normalization
-\end{itemize}
-\vspace{0.2cm}
-
-\textbf{Normalization:}
-\begin{itemize}
-    \item CIFAR-10/100 mean/std: $(0.4914, 0.4822, 0.4465)$ / $(0.2023, 0.1994, 0.2010)$
-    \item Tiny ImageNet uses ImageNet normalization: $(0.485, 0.456, 0.406)$ / $(0.229, 0.224, 0.225)$
-\end{itemize}
-\vspace{0.2cm}
-
-\textbf{Augmentation presets from the code:}
-\begin{itemize}
-    \item \texttt{none}: resize + normalize only
-    \item \texttt{basic}: \texttt{RandomCrop(image\_size, padding=max(4, image\_size/8))} + horizontal flip
-    \item \texttt{strong}: basic + \texttt{RandAugment(num\_ops=2, magnitude=9)} + \texttt{RandomErasing(p=0.25)}
-\end{itemize}
-\end{frame}
-
-\begin{frame}
-\frametitle{Model Architecture}
-\textbf{Unified abstraction used in the repository:}
-\[
-\text{backbone} \rightarrow \text{global pooling} \rightarrow \text{embedding} \rightarrow \text{classifier}
-\]
-\vspace{0.2cm}
-
+\frametitle{Modele i warianty}
 \textbf{Teacher:}
 \begin{itemize}
     \item ResNet-50
-    \item embedding dimension: 2048
-    \item initialized from ImageNet weights, then fine-tuned on the target dataset
+    \item inicjalizacja wagami ImageNet
+    \item najlepszy wynik walidacyjny: \textbf{81.82\%}
 \end{itemize}
 \vspace{0.2cm}
 
-\textbf{Students:}
-\begin{itemize}
-    \item ResNet-18, embedding dim 512
-    \item MobileNetV3-small, embedding dim 576
-    \item Tiny CNN, embedding dim 128
-\end{itemize}
-\end{frame}
-
-\begin{frame}
-\frametitle{How Embeddings Are Wired into Training}
-\textbf{Per training batch:}
-\begin{enumerate}
-    \item Same image goes through teacher and student.
-    \item Teacher returns logits and embedding.
-    \item Student returns logits and embedding.
-    \item Student embedding is projected into teacher embedding space.
-    \item Loss is computed from labels and/or teacher targets.
-\end{enumerate}
-\vspace{0.2cm}
-
-\textbf{Projector used when dimensions differ:}
-\begin{itemize}
-    \item if dims match: identity
-    \item otherwise: \texttt{Linear(student\_dim, hidden)} $\rightarrow$ ReLU $\rightarrow$ \texttt{Linear(hidden, teacher\_dim)}
-    \item hidden dimension: $\max(2d_s,\ d_t)$ where $d_s$ is student embedding size and $d_t$ is teacher embedding size
-\end{itemize}
-\vspace{0.2cm}
-
-\textbf{Inference:}
-\begin{itemize}
-    \item only the student classifier is needed for prediction
-    \item teacher embeddings are not required during deployment
-\end{itemize}
-\end{frame}
-
-\section{Training Objective}
-\begin{frame}
-\frametitle{Loss Functions}
-\textbf{Classification loss:}
-\[
-L_{cls} = \text{CrossEntropy}(z_s, y)
-\]
-
-\textbf{Embedding loss:}
-\begin{itemize}
-    \item MSE loss
-    \item cosine embedding loss
-    \item optional L2 normalization of teacher and projected student embeddings before the loss
-\end{itemize}
-
-\textbf{Logit distillation loss:}
-\[
-L_{logit} = KL\left(\log \sigma(z_s/T), \sigma(z_t/T)\right)\cdot T^2
-\]
-\vspace{0.15cm}
-
-\textbf{Combined objective:}
-\[
-L = w_{cls}L_{cls} + w_{emb}L_{emb} + w_{logit}L_{logit}
-\]
-\end{frame}
-
-\begin{frame}
-\frametitle{Training Configuration}
-\textbf{Implementation defaults in the code:}
-\begin{itemize}
-    \item optimizer: AdamW
-    \item learning rate: \texttt{3e-4}
-    \item weight decay: \texttt{1e-4}
-    \item scheduler: cosine annealing over epochs
-    \item mixed precision on CUDA, TF32 enabled, optional \texttt{channels\_last}
-\end{itemize}
-\vspace{0.2cm}
-
-\textbf{CLI defaults:}
-\begin{itemize}
-    \item teacher: 5 epochs, batch size 64, image size 160
-    \item baseline/distillation: 3 epochs, batch size 64, image size 160
-    \item default augmentation: \texttt{basic}
-\end{itemize}
-\vspace{0.2cm}
-
-\textbf{Actual Colab experiment presets:}
-\begin{itemize}
-    \item CIFAR notebook: image size 64, batch size 96, 2 teacher epochs, 3 student epochs
-    \item Tiny ImageNet notebook: image size 64, batch size 128, 6 teacher epochs, 8 student epochs
-\end{itemize}
-\end{frame}
-
-\section{Experiments}
-\begin{frame}
-\frametitle{Core Experimental Matrix}
-\textbf{Baseline comparisons:}
-\begin{itemize}
-    \item train each student with classification loss only
-    \item compare against distilled counterpart under the same data pipeline
-\end{itemize}
-\vspace{0.2cm}
-
-\textbf{Students considered:}
+\textbf{Studenci:}
 \begin{itemize}
     \item ResNet-18
-    \item MobileNetV3-small
-    \item Tiny CNN
+    \item tiny\_cnn
 \end{itemize}
 \vspace{0.2cm}
 
-\textbf{Why Tiny CNN matters:}
+\textbf{Porównywane warianty:}
 \begin{itemize}
-    \item it creates a much larger capacity gap relative to ResNet-50
-    \item this is where embedding distillation is most likely to show clear gains
+    \item baseline: tylko Cross-Entropy
+    \item embed+cls: strata klasyfikacyjna + dopasowanie embeddingow
+    \item embed only
+    \item logit+cls
+    \item embed+logit+cls
 \end{itemize}
 \end{frame}
 
 \begin{frame}
-\frametitle{Ablations and Additional Experiments}
-\textbf{Implemented ablations:}
+\frametitle{Jak wyglądała destylacja}
+\textbf{Embedding distillation:}
 \begin{itemize}
-    \item baseline classification only
-    \item embedding only
-    \item embedding + classification
-    \item logit + classification
-    \item embedding + logit + classification
-    \item MSE vs cosine embedding loss
-    \item with vs without embedding normalization
+    \item student i teacher dostają ten sam obraz
+    \item teacher zwraca logity oraz embedding
+    \item student zwraca logity oraz embedding
+    \item embedding studenta jest porównywany z embeddingiem teacher'a
 \end{itemize}
 \vspace{0.2cm}
 
-\textbf{Main evaluation metrics:}
+\textbf{W finalnych wynikach:}
 \begin{itemize}
-    \item accuracy
-    \item macro-F1
+    \item nie użyto PCA bottleneck w końcowym notebooku (\texttt{DISTILL\_DIM = 0})
+    \item dla embedding KD zastosowano MSE + normalizację embeddingów
+    \item dla logit KD użyto temperatury \texttt{T = 4}
 \end{itemize}
 \vspace{0.2cm}
 
-\textbf{Additional outputs:}
-\begin{itemize}
-    \item per-epoch learning curves
-    \item baseline vs distillation bar/scatter plots
-    \item PCA and t-SNE embedding visualizations
-\end{itemize}
+\textbf{Wniosek praktyczny:} sprawdziliśmy nie tylko sam embedding KD, ale też czy lepiej działa destylacja logitów.
 \end{frame}
 
-\section{Results}
 \begin{frame}
-\frametitle{Results to Insert After Training}
-\textbf{Final report should include:}
-\begin{itemize}
-    \item teacher validation/test accuracy and macro-F1
-    \item baseline vs distillation for each student
-    \item parameter count vs performance plots
-    \item ablation table for one fixed student
-    \item representative learning curves
-    \item PCA/t-SNE plots showing teacher, baseline student, and distilled student embeddings
-\end{itemize}
+\frametitle{Wyniki główne}
+\small
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Model} & \textbf{Wariant} & \textbf{Test Acc} & \textbf{Macro-F1} \\
+\midrule
+ResNet-18 & baseline & 58.32\% & 58.13\% \\
+ResNet-18 & embed+cls & 59.08\% & 58.90\% \\
+\midrule
+tiny\_cnn & baseline & 27.71\% & 25.47\% \\
+tiny\_cnn & embed+cls & 27.46\% & 25.08\% \\
+\bottomrule
+\end{tabular}
 \vspace{0.25cm}
 
-\textbf{Recommended emphasis:}
 \begin{itemize}
-    \item absolute performance
-    \item delta over baseline
-    \item which student benefits most
-    \item whether harder dataset and weaker students increase the distillation effect
+    \item Dla \textbf{ResNet-18} embedding distillation dała tylko niewielką poprawę: \textbf{+0.76 p.p.}
+    \item Dla \textbf{tiny\_cnn} nie zaobserwowano poprawy.
+    \item Sama hipoteza, że \textit{embedding distillation} wyraźnie pomaga słabszym modelom, nie potwierdziła się.
 \end{itemize}
 \end{frame}
 
 \begin{frame}
-\frametitle{Expected Interpretation}
-\textbf{Questions we want the final results to answer:}
-\begin{itemize}
-    \item Does embedding distillation outperform baseline training?
-    \item Is embedding supervision alone enough, or does it need classification loss?
-    \item Does logit distillation help on top of embeddings?
-    \item Does normalization improve alignment and stability?
-    \item Which student profits most from teacher guidance?
-\end{itemize}
-\vspace{0.2cm}
+\frametitle{Porównanie modeli}
+\begin{center}
+\includegraphics[width=\textwidth]{C:/Users/nazar/source/repos/knowledge_distillation/presentation/assets/acc_by_model.png}
+\end{center}
+\end{frame}
 
-\textbf{Working expectation:}
+\begin{frame}
+\frametitle{Ablacje dla ResNet-18}
+\begin{center}
+\includegraphics[width=0.95\textwidth]{C:/Users/nazar/source/repos/knowledge_distillation/presentation/assets/variant_scores.png}
+\end{center}
+\vspace{0.1cm}
+\small
 \begin{itemize}
-    \item gains should be small on easy datasets or strong students
-    \item gains should be clearer on Tiny ImageNet and for Tiny CNN / MobileNetV3-small
+    \item \textbf{embed only} praktycznie się załamał: około \textbf{0.7\%} accuracy
+    \item \textbf{logit+cls} okazał się najlepszy: \textbf{61.10\%}
+    \item \textbf{embed+logit+cls} dał wynik bardzo podobny: \textbf{60.86\%}
 \end{itemize}
 \end{frame}
 
-\section{Summary}
 \begin{frame}
-\frametitle{Summary}
-\textbf{What is implemented:}
-\begin{itemize}
-    \item full teacher-baseline-distillation pipeline
-    \item multiple datasets and student architectures
-    \item embedding and logit distillation objectives
-    \item ablations, metrics, visualizations, and presentation-ready artifacts
-\end{itemize}
-\vspace{0.2cm}
+\frametitle{Wizualizacja embeddingów}
+\begin{columns}[c]
+\column{0.5\textwidth}
+\includegraphics[width=\textwidth]{C:/Users/nazar/source/repos/knowledge_distillation/presentation/assets/pca_models.png}
 
-\textbf{Main technical takeaway:}
-\begin{itemize}
-    \item embedding distillation is a training-time constraint on student representations
-    \item the deployed model remains lightweight because only the student is used at inference
-\end{itemize}
+\column{0.5\textwidth}
+\includegraphics[width=\textwidth]{C:/Users/nazar/source/repos/knowledge_distillation/presentation/assets/tsne_models.png}
+\end{columns}
 \vspace{0.2cm}
-
-\textbf{Final claim to validate experimentally:}
+\small
 \begin{itemize}
-    \item distillation is most valuable when the dataset is hard enough and the student is small enough
+    \item Wizualizacje mają charakter \textbf{jakościowy}, a nie rozstrzygający.
+    \item Nie widać wyraźnego, stabilnego upodobnienia embeddingów studenta do teacher'a po samym embedding KD.
+    \item To zgadza się z wynikami liczbowymi: sygnał z embeddingów okazał się słaby.
+\end{itemize}
+\end{frame}
+
+\begin{frame}
+\frametitle{Wnioski}
+\begin{itemize}
+    \item Embedding distillation nie przyniosła oczekiwanej, wyraźnej poprawy.
+    \item Dla ResNet-18 zysk był niewielki, a dla tiny\_cnn nie było poprawy.
+    \item Najlepszy wynik uzyskał wariant \textbf{logit+cls}, czyli klasyczna destylacja logitów.
+    \item Oznacza to, że w naszym ustawieniu \textbf{logity teacher'a okazały się bardziej użyteczne niż same embeddingi końcowe}.
+    \item Ze względu na ograniczenia czasowe nie wdrażaliśmy bardziej zaawansowanej destylacji warstw pośrednich, która mogłaby być skuteczniejsza.
 \end{itemize}
 \end{frame}
 
 \begin{frame}
 \begin{center}
-\Huge Thank you
+\Huge Dziękujemy za uwagę
 \end{center}
 \end{frame}
 
