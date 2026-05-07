@@ -120,6 +120,10 @@ def logit_kd_loss(student_logits: torch.Tensor, teacher_logits: torch.Tensor, te
     return F.kl_div(s, t, reduction="batchmean") * (temperature * temperature)
 
 
+def zero_like_loss(reference: torch.Tensor) -> torch.Tensor:
+    return torch.zeros((), device=reference.device, dtype=reference.dtype)
+
+
 def run_epoch(
     student: nn.Module,
     teacher: nn.Module,
@@ -185,7 +189,10 @@ def run_epoch(
                 teacher_emb=teacher_emb,
                 loss_name=embed_loss_name,
             )
-            kd_loss = logit_kd_loss(student_logits, teacher_logits, temperature=temperature)
+            if logit_weight > 0:
+                kd_loss = logit_kd_loss(student_logits, teacher_logits, temperature=temperature)
+            else:
+                kd_loss = zero_like_loss(cls_loss)
             total = cls_weight * cls_loss + embed_weight * embed_loss + logit_weight * kd_loss
 
         if training and optimizer is not None:

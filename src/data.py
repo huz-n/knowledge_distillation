@@ -113,7 +113,8 @@ def _build_transforms(
 def _download_tiny_imagenet_if_needed(data_dir: Path) -> Path:
     tiny_root = data_dir / "tiny-imagenet-200"
     train_dir = tiny_root / "train"
-    if train_dir.exists():
+    complete_flag = tiny_root / ".extract_complete"
+    if train_dir.exists() and complete_flag.exists():
         return tiny_root
 
     zip_path = data_dir / "tiny-imagenet-200.zip"
@@ -131,6 +132,7 @@ def _download_tiny_imagenet_if_needed(data_dir: Path) -> Path:
             if target.exists():
                 continue
             zf.extract(member, path=data_dir)
+    complete_flag.write_text("ok\n", encoding="utf-8")
     print("Extraction finished.")
     return tiny_root
 
