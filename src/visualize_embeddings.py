@@ -64,7 +64,7 @@ def load_teacher(device: torch.device, args: argparse.Namespace, num_classes: in
     ).to(device)
     if args.teacher_checkpoint:
         state = torch.load(args.teacher_checkpoint, map_location=device)
-        model.load_state_dict(state["model"] if "model" in state else state, strict=False)
+        model.load_state_dict(state["model"] if "model" in state else state, strict=True)
     model.eval()
     for p in model.parameters():
         p.requires_grad = False
@@ -78,7 +78,7 @@ def load_baseline_student(
         device
     )
     state = torch.load(args.baseline_checkpoint, map_location=device)
-    model.load_state_dict(state["model"] if "model" in state else state, strict=False)
+    model.load_state_dict(state["model"] if "model" in state else state, strict=True)
     model.eval()
     return model
 
@@ -89,17 +89,42 @@ def load_distill_student(
     model = build_model_with_embedding(model_name=args.student_model, num_classes=num_classes, pretrained=False).to(
         device
     )
-    if model.embedding_dim == teacher_emb_dim:
-        projector: torch.nn.Module = torch.nn.Identity()
-    else:
-        projector = torch.nn.Linear(model.embedding_dim, teacher_emb_dim)
-    projector = projector.to(device)
-
     state = torch.load(args.distill_checkpoint, map_location=device)
     student_state = state["student"] if "student" in state else state.get("model", state)
-    model.load_state_dict(student_state, strict=False)
-    if "projector" in state:
-        projector.load_state_dict(state["projector"], strict=False)
+    model.load_state_dict(student_state, strict=True)
+
+    projector: torch.nn.Module
+    proj_state = state.get("projector", None)
+    if proj_state is None:
+        if model.embedding_dim == teacher_emb_dim:
+            projector = torch.nn.Identity()
+        else:
+            projector = torch.nn.Linear(model.embedding_dim, teacher_emb_dim)
+    else:
+        keys = set(proj_state.keys())
+        if len(keys) == 0:
+            projector = torch.nn.Identity()
+        elif "weight" in keys:
+            out_dim, in_dim = proj_state["weight"].shape
+            projector = torch.nn.Linear(in_dim, out_dim)
+            projector.load_state_dict(proj_state, strict=True)
+        elif "0.weight" in keys and "2.weight" in keys:
+            h_out, in_dim = proj_state["0.weight"].shape
+            out_dim, h_in = proj_state["2.weight"].shape
+            if h_out != h_in:
+                raise ValueError("Invalid MLP projector checkpoint dimensions.")
+            projector = torch.nn.Sequential(
+                torch.nn.Linear(in_dim, h_out),
+                torch.nn.ReLU(),
+                torch.nn.Linear(h_out, out_dim),
+            )
+            projector.load_state_dict(proj_state, strict=True)
+        else:
+            raise ValueError(
+                f"Unsupported projector checkpoint format. Keys: {sorted(list(keys))[:8]}"
+            )
+
+    projector = projector.to(device)
     model.eval()
     projector.eval()
     return model, projector

@@ -73,6 +73,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-val-batches", type=int, default=0)
     parser.add_argument("--channels-last", action="store_true")
     parser.add_argument("--embed-loss", type=str, default="mse", choices=["mse", "cosine"])
+    parser.add_argument(
+        "--embed-normalize",
+        action="store_true",
+        help="L2-normalize teacher/student embeddings before embedding distillation loss.",
+    )
     parser.add_argument("--cls-weight", type=float, default=1.0)
     parser.add_argument("--embed-weight", type=float, default=1.0)
     parser.add_argument("--logit-weight", type=float, default=0.0)
@@ -128,6 +133,7 @@ def run_epoch(
     embed_weight: float,
     logit_weight: float,
     temperature: float,
+    embed_normalize: bool,
     optimizer: Optional[torch.optim.Optimizer] = None,
     scaler: Optional[torch.amp.GradScaler] = None,
     max_batches: int = 0,
@@ -167,18 +173,18 @@ def run_epoch(
 
         with torch.autocast(device_type=device.type, enabled=autocast_enabled):
             student_logits, student_emb = student(x, return_embedding=True)
-            proj_emb = F.normalize(projector(student_emb), dim=1)
-            teacher_emb = F.normalize(teacher_emb, dim=1)
-            
+            proj_emb = projector(student_emb)
+            if embed_normalize:
+                proj_emb = F.normalize(proj_emb, dim=1)
+                teacher_emb = F.normalize(teacher_emb, dim=1)
 
             cls_loss = cls_criterion(student_logits, y)
-            # embed_loss = embed_loss_value(
-            #     loss_fn=embed_criterion,
-            #     student_emb=proj_emb,
-            #     teacher_emb=teacher_emb,
-            #     loss_name=embed_loss_name,
-            # )
-            embed_loss = F.mse_loss(proj_emb, teacher_emb)
+            embed_loss = embed_loss_value(
+                loss_fn=embed_criterion,
+                student_emb=proj_emb,
+                teacher_emb=teacher_emb,
+                loss_name=embed_loss_name,
+            )
             kd_loss = logit_kd_loss(student_logits, teacher_logits, temperature=temperature)
             total = cls_weight * cls_loss + embed_weight * embed_loss + logit_weight * kd_loss
 
@@ -224,6 +230,7 @@ def evaluate_test(
     embed_weight: float,
     logit_weight: float,
     temperature: float,
+    embed_normalize: bool,
     max_batches: int = 0,
     channels_last: bool = False,
     num_classes: int = 10,
@@ -241,6 +248,7 @@ def evaluate_test(
         embed_weight=embed_weight,
         logit_weight=logit_weight,
         temperature=temperature,
+        embed_normalize=embed_normalize,
         optimizer=None,
         scaler=None,
         max_batches=max_batches,
@@ -311,6 +319,11 @@ def main() -> None:
 
     if args.cls_weight == 0 and args.embed_weight == 0 and args.logit_weight == 0:
         raise ValueError("At least one of --cls-weight / --embed-weight / --logit-weight must be > 0.")
+    if args.logit_weight > 0 and not args.teacher_checkpoint:
+        raise ValueError(
+            "Logit distillation requires --teacher-checkpoint. "
+            "Without it, teacher classifier head is not dataset-trained."
+        )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     loaders = build_image_classification_loaders(
@@ -339,7 +352,7 @@ def main() -> None:
 
     if args.teacher_checkpoint:
         state = torch.load(args.teacher_checkpoint, map_location=device)
-        teacher.load_state_dict(state["model"] if "model" in state else state, strict=False)
+        teacher.load_state_dict(state["model"] if "model" in state else state, strict=True)
     for param in teacher.parameters():
         param.requires_grad = False
     teacher.eval()
@@ -393,6 +406,7 @@ def main() -> None:
             embed_weight=args.embed_weight,
             logit_weight=args.logit_weight,
             temperature=args.temperature,
+            embed_normalize=args.embed_normalize,
             optimizer=optimizer,
             scaler=scaler,
             max_batches=args.max_train_batches,
@@ -412,6 +426,7 @@ def main() -> None:
             embed_weight=args.embed_weight,
             logit_weight=args.logit_weight,
             temperature=args.temperature,
+            embed_normalize=args.embed_normalize,
             optimizer=None,
             scaler=None,
             max_batches=args.max_val_batches,
@@ -474,6 +489,7 @@ def main() -> None:
         embed_weight=args.embed_weight,
         logit_weight=args.logit_weight,
         temperature=args.temperature,
+        embed_normalize=args.embed_normalize,
         max_batches=args.max_val_batches,
         channels_last=args.channels_last,
         num_classes=num_classes,
@@ -487,6 +503,7 @@ def main() -> None:
         "dataset": args.dataset,
         "teacher_checkpoint_used": bool(args.teacher_checkpoint),
         "augment": args.augment,
+        "embed_normalize": args.embed_normalize,
         "student_embedding_dim": student.embedding_dim,
         "teacher_embedding_dim": teacher.embedding_dim,
         "student_total_params": student_total_params,
